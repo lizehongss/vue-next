@@ -1,4 +1,5 @@
 import { reactive, readonly, toRaw } from './reactive'
+// 检查事件
 import { OperationTypes } from './operations'
 import { track, trigger } from './effect'
 import { LOCKED } from './lock'
@@ -12,6 +13,7 @@ const builtInSymbols = new Set(
 )
 
 function createGetter(isReadonly: boolean) {
+  //Reflect返回trap行为
   return function get(target: any, key: string | symbol, receiver: any) {
     const res = Reflect.get(target, key, receiver)
     if (isSymbol(key) && builtInSymbols.has(key)) {
@@ -20,7 +22,10 @@ function createGetter(isReadonly: boolean) {
     if (isRef(res)) {
       return res.value
     }
+    //用于保存原始数据
     track(target, OperationTypes.GET, key)
+    //这里判断了 Reflect 返回的数据是否还是对象，
+    //如果是对象，则再走一次 proxy ，从而获得了对对象内部的侦测
     return isObject(res)
       ? isReadonly
         ? // need to lazy access readonly and reactive here to avoid
@@ -91,7 +96,7 @@ function ownKeys(target: any): (string | number | symbol)[] {
   track(target, OperationTypes.ITERATE)
   return Reflect.ownKeys(target)
 }
-
+// ProxyHandler暂未知，可能为typeScript内部实现类型
 export const mutableHandlers: ProxyHandler<any> = {
   get: createGetter(false),
   set,

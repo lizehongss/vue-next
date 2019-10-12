@@ -47,5 +47,9 @@
     "ts-jest": "^24.0.2",
     "typescript": "^3.5.3",
     "yorkie": "^2.0.0"
+  },
+  "dependencies": {
+    "@types/acorn": "^4.0.5",
+    "yarn": "^1.19.1"
   }
 }

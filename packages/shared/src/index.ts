@@ -37,10 +37,13 @@ export const isFunction = (val: any): val is Function =>
   typeof val === 'function'
 export const isString = (val: any): val is string => typeof val === 'string'
 export const isSymbol = (val: any): val is symbol => typeof val === 'symbol'
+// (val: any) val可为任意值, Record<k, t> 将k中的所有属性值转换为T类型
+// pet is Fish是类型谓词, 将变量缩减为那个具体的类型，使得不用多次使用类型断言
 export const isObject = (val: any): val is Record<any, any> =>
   val !== null && typeof val === 'object'
 
 export const objectToString = Object.prototype.toString
+// 传值未知，返回值一定为string
 export const toTypeString = (value: unknown): string =>
   objectToString.call(value)
 

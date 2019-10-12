@@ -132,6 +132,7 @@ export function track(
     if (type === OperationTypes.ITERATE) {
       key = ITERATE_KEY
     }
+    // targetMap保存原始数据
     let depsMap = targetMap.get(target)
     if (depsMap === void 0) {
       targetMap.set(target, (depsMap = new Map()))

@@ -1,8 +1,12 @@
 const fs = require('fs')
 const path = require('path')
+//从tsconfig.json 文件中继承所有的编译器选项和文件列表
 const ts = require('rollup-plugin-typescript2')
+//打包时动态替换代码中的内容
 const replace = require('rollup-plugin-replace')
+// 为模块起别名
 const alias = require('rollup-plugin-alias')
+//支持导入json模块
 const json = require('rollup-plugin-json')
 
 if (!process.env.TARGET) {
@@ -33,16 +37,16 @@ let hasTSChecked = false
 
 const configs = {
   esm: {
-    file: resolve(`dist/${name}.esm-bundler.js`),
-    format: `es`
+    file: resolve(`dist/${name}.esm-bundler.js`), //要写入的文件
+    format: `es` //生成包的格式 es 为将软件包保存为ES模块文件
   },
   cjs: {
     file: resolve(`dist/${name}.cjs.js`),
-    format: `cjs`
+    format: `cjs` // commonJS,适应于Node 和 Browserify/Webpack
   },
   global: {
     file: resolve(`dist/${name}.global.js`),
-    format: `iife`
+    format: `iife` // 一个自动执行的功能， 适合作为<script>标签
   },
   'esm-browser': {
     file: resolve(`dist/${name}.esm-browser.js`),
@@ -57,6 +61,7 @@ const packageConfigs = process.env.PROD_ONLY
   ? []
   : packageFormats.map(format => createConfig(configs[format]))
 
+// 为生产环境时打包选项，暂时忽略
 if (process.env.NODE_ENV === 'production') {
   packageFormats.forEach(format => {
     if (format === 'cjs') {
@@ -106,10 +111,13 @@ function createConfig(output, plugins = []) {
   const externals = Object.keys(aliasOptions).filter(p => p !== '@vue/shared')
 
   return {
+    //包入口
     input: resolve(`src/index.ts`),
     // Global and Browser ESM builds inlines everything so that they can be
     // used alone.
+    // 外链
     external: isGlobalBuild || isBrowserESMBuild ? [] : externals,
+    // 插件
     plugins: [
       json({
         namedExports: false

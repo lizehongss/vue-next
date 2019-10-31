@@ -22,7 +22,8 @@ function createGetter(isReadonly: boolean) {
     if (isRef(res)) {
       return res.value
     }
-    //用于保存原始数据
+    //用于将数据添加到监听函数，使数据改变时能够触发监听函数
+    //监听函数收集依赖方法
     track(target, OperationTypes.GET, key)
     //这里判断了 Reflect 返回的数据是否还是对象，
     //如果是对象，则再走一次 proxy ，从而获得了对对象内部的侦测

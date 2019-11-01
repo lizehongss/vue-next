@@ -57,6 +57,7 @@ function loggingIdentity<T extends Lengthwise>(arg: T) : T {
 }
 ```
 - 接口
+
  在typeScript里, 接口的作用是对值所具有的结构进行类型命名和定义契约
  ```
  interface LabelledValue {
@@ -85,7 +86,8 @@ function loggingIdentity<T extends Lengthwise>(arg: T) : T {
  ```
 
 - 基础类型
-1. 基础类型定义
+
+基础类型定义
 ```
 //布尔值
 let isDone: boolean = false
@@ -148,3 +150,95 @@ class exGreeter extends Greeter {
 }
 ```
 公共，私有与受保护的修饰符
+默认为**public**可以自由访问程序里定义的成员
+**private**不能在声明它的类的外部访问
+**protected** 在派生类中仍然可以访问
+**readonly** 将关键字属性设置为只读,只读属性必须在声明时或构造函数里被初始化
+存取器
+支持通过getters/setters来截取对对象成员的访问
+```
+class Employee {
+  private _fullName: string;
+
+  get fullName(): string {
+    return this._fullName
+  }
+  set fullName(newName: string) {
+    if () {
+      //code somthong
+    } else {
+      //code something
+    }
+  }
+}
+```
+**static**定义静态属性, 每个实例想要访问这个属性时,要在origin前面加上类名.
+**abstract**定义抽象类,抽象类中的抽象方法不包含具体实现并且必须在派生类中实现.
+```
+abstract class Animal {
+    abstract makeSound(): void;
+    move(): void {
+        console.log('roaming the earch...');
+    }
+}
+```
+- 函数
+
+函数完整类型
+```
+let myAdd: (x: number, y: number) => number = function(x:number, y:number): number { return x + y};
+```
+可使用 **?** 让参数可选择
+```
+function buildName(firstName: string, lastName?: string) {
+  if (lastName)
+    return firstName + " " + lasteName;
+  else 
+    return firstName
+}
+// 可选参数必须跟在必须参数后面
+```
+可为参数提供一个默认值
+```
+function buildName (firstName: string, lastName = "smith") {
+  // code something
+}
+```
+可将所有参数收集到一个变量里
+```
+function buildName(firstName: string, ...restOfName: string[]) {
+  // code something
+}
+```
+**重载的实现**：为同一个函数提供多个函数类型定义来进行函数重载
+```
+function pickCard(x: {suit: string; card: number; }[]): number;
+function pickCard(x: number): {suit: string; card: number; };
+```
+- 枚举
+1. 数字枚举
+```
+enum Direction {
+  Up = 1,
+  Down,
+  Left,
+  Right
+}
+//Up值为1，Down值为2，以此类推
+```
+2. 字符串枚举
+```
+enum Direction {
+  Up = "Up",
+  Down = "DOWN",
+  Left = "LEFT",
+  Right = "RIGHT"
+}
+```
+3. 异构枚举
+```
+enum BooleanLikeHeterogeneousEnum {
+    No = 0,
+    Yes = "YES",
+}
+```

@@ -3,15 +3,26 @@ import {
   stop,
   isRef,
   Ref,
+  ComputedRef,
   ReactiveEffectOptions
 } from '@vue/reactivity'
 import { queueJob } from './scheduler'
-import { EMPTY_OBJ, isObject, isArray, isFunction, isString } from '@vue/shared'
+import {
+  EMPTY_OBJ,
+  isObject,
+  isArray,
+  isFunction,
+  isString,
+  hasChanged,
+  NOOP
+} from '@vue/shared'
 import { recordEffect } from './apiReactivity'
 import {
   currentInstance,
   ComponentInternalInstance,
-  currentSuspense
+  currentSuspense,
+  Data,
+  isInSSRComponentSetup
 } from './component'
 import {
   ErrorCodes,
@@ -19,8 +30,24 @@ import {
   callWithAsyncErrorHandling
 } from './errorHandling'
 import { onBeforeUnmount } from './apiLifecycle'
-import { queuePostRenderEffect } from './createRenderer'
-import { WatchHandler } from './apiOptions'
+import { queuePostRenderEffect } from './renderer'
+import { warn } from './warning'
+
+export type WatchEffect = (onCleanup: CleanupRegistrator) => void
+
+export type WatchSource<T = any> = Ref<T> | ComputedRef<T> | (() => T)
+
+export type WatchCallback<T = any> = (
+  value: T,
+  oldValue: T,
+  onCleanup: CleanupRegistrator
+) => any
+
+type MapSources<T> = {
+  [K in keyof T]: T[K] extends WatchSource<infer V> ? V : never
+}
+
+export type CleanupRegistrator = (invalidate: () => void) => void
 
 export interface WatchOptions {
   lazy?: boolean
@@ -30,48 +57,43 @@ export interface WatchOptions {
   onTrigger?: ReactiveEffectOptions['onTrigger']
 }
 
-type StopHandle = () => void
-
-type WatcherSource<T = any> = Ref<T> | (() => T)
-
-type MapSources<T> = {
-  [K in keyof T]: T[K] extends WatcherSource<infer V> ? V : never
-}
-
-export type CleanupRegistrator = (invalidate: () => void) => void
-
-type SimpleEffect = (onCleanup: CleanupRegistrator) => void
+export type StopHandle = () => void
 
 const invoke = (fn: Function) => fn()
 
+// initial value for watchers to trigger on undefined initial values
+const INITIAL_WATCHER_VALUE = {}
+
 // overload #1: simple effect
-export function watch(effect: SimpleEffect, options?: WatchOptions): StopHandle
+export function watch(effect: WatchEffect, options?: WatchOptions): StopHandle
 
 // overload #2: single source + cb
 export function watch<T>(
-  source: WatcherSource<T>,
-  cb: WatchHandler<T>,
+  source: WatchSource<T>,
+  cb: WatchCallback<T>,
   options?: WatchOptions
 ): StopHandle
 
 // overload #3: array of multiple sources + cb
-export function watch<T extends WatcherSource<unknown>[]>(
+// Readonly constraint helps the callback to correctly infer value types based
+// on position in the source array. Otherwise the values will get a union type
+// of all possible value types.
+export function watch<T extends Readonly<WatchSource<unknown>[]>>(
   sources: T,
-  cb: (
-    newValues: MapSources<T>,
-    oldValues: MapSources<T>,
-    onCleanup: CleanupRegistrator
-  ) => any,
+  cb: WatchCallback<MapSources<T>>,
   options?: WatchOptions
 ): StopHandle
 
 // implementation
 export function watch<T = any>(
-  effectOrSource: WatcherSource<T> | WatcherSource<T>[] | SimpleEffect,
-  cbOrOptions?: WatchHandler<T> | WatchOptions,
+  effectOrSource: WatchSource<T> | WatchSource<T>[] | WatchEffect,
+  cbOrOptions?: WatchCallback<T> | WatchOptions,
   options?: WatchOptions
 ): StopHandle {
-  if (isFunction(cbOrOptions)) {
+  if (isInSSRComponentSetup && !(options && options.flush === 'sync')) {
+    // component watchers during SSR are no-op
+    return NOOP
+  } else if (isFunction(cbOrOptions)) {
     // effect callback as 2nd argument - this is a source watcher
     return doWatch(effectOrSource, cbOrOptions, options)
   } else {
@@ -82,10 +104,8 @@ export function watch<T = any>(
 }
 
 function doWatch(
-  source: WatcherSource | WatcherSource[] | SimpleEffect,
-  cb:
-    | ((newValue: any, oldValue: any, onCleanup: CleanupRegistrator) => any)
-    | null,
+  source: WatchSource | WatchSource[] | WatchEffect,
+  cb: WatchCallback | null,
   { lazy, deep, flush, onTrack, onTrigger }: WatchOptions = EMPTY_OBJ
 ): StopHandle {
   const instance = currentInstance
@@ -131,27 +151,27 @@ function doWatch(
 
   let cleanup: Function
   const registerCleanup: CleanupRegistrator = (fn: () => void) => {
-    // TODO wrap the cleanup fn for error handling
-    cleanup = runner.onStop = () => {
+    cleanup = runner.options.onStop = () => {
       callWithErrorHandling(fn, instance, ErrorCodes.WATCH_CLEANUP)
     }
   }
 
-  let oldValue = isArray(source) ? [] : undefined
+  let oldValue = isArray(source) ? [] : INITIAL_WATCHER_VALUE
   const applyCb = cb
     ? () => {
         if (instance && instance.isUnmounted) {
           return
         }
         const newValue = runner()
-        if (deep || newValue !== oldValue) {
+        if (deep || hasChanged(newValue, oldValue)) {
           // cleanup before running cb again
           if (cleanup) {
             cleanup()
           }
           callWithAsyncErrorHandling(cb, instance, ErrorCodes.WATCH_CALLBACK, [
             newValue,
-            oldValue,
+            // pass undefined as the old value when it's changed for the first time
+            oldValue === INITIAL_WATCHER_VALUE ? undefined : oldValue,
             registerCleanup
           ])
           oldValue = newValue
@@ -187,19 +207,32 @@ function doWatch(
     scheduler: applyCb ? () => scheduler(applyCb) : scheduler
   })
 
-  if (!lazy) {
+  if (lazy && cb) {
+    oldValue = runner()
+  } else {
+    if (__DEV__ && lazy && !cb) {
+      warn(
+        `watch() lazy option is only respected when using the ` +
+          `watch(getter, callback) signature.`
+      )
+    }
     if (applyCb) {
       scheduler(applyCb)
     } else {
       scheduler(runner)
     }
-  } else {
-    oldValue = runner()
   }
 
   recordEffect(runner)
   return () => {
     stop(runner)
+    if (instance) {
+      const effects = instance.effects!
+      const index = effects.indexOf(runner)
+      if (index > -1) {
+        effects.splice(index, 1)
+      }
+    }
   }
 }
 
@@ -210,14 +243,14 @@ export function instanceWatch(
   cb: Function,
   options?: WatchOptions
 ): StopHandle {
-  const ctx = this.renderProxy!
+  const ctx = this.proxy as Data
   const getter = isString(source) ? () => ctx[source] : source.bind(ctx)
   const stop = watch(getter, cb.bind(ctx), options)
   onBeforeUnmount(stop, this)
   return stop
 }
 
-function traverse(value: any, seen: Set<any> = new Set()) {
+function traverse(value: unknown, seen: Set<unknown> = new Set()) {
   if (!isObject(value) || seen.has(value)) {
     return
   }

@@ -1,16 +1,16 @@
 import { ComponentInternalInstance, currentInstance } from './component'
 import {
   VNode,
-  NormalizedChildren,
+  VNodeNormalizedChildren,
   normalizeVNode,
-  VNodeChild,
-  VNodeChildren
+  VNodeChild
 } from './vnode'
-import { isArray, isFunction } from '@vue/shared'
+import { isArray, isFunction, EMPTY_OBJ } from '@vue/shared'
 import { ShapeFlags } from './shapeFlags'
 import { warn } from './warning'
+import { isKeepAlive } from './components/KeepAlive'
 
-export type Slot = (...args: any[]) => VNodeChildren
+export type Slot = (...args: any[]) => VNode[]
 
 export type InternalSlots = {
   [name: string]: Slot
@@ -20,6 +20,9 @@ export type Slots = Readonly<InternalSlots>
 
 export type RawSlots = {
   [name: string]: unknown
+  // manual render fn hint to skip forced children updates
+  $stable?: boolean
+  // internal, indicates compiler generated slots = can skip normalization
   _compiled?: boolean
 }
 
@@ -43,7 +46,7 @@ const normalizeSlot = (key: string, rawSlot: Function): Slot => (
 
 export function resolveSlots(
   instance: ComponentInternalInstance,
-  children: NormalizedChildren
+  children: VNodeNormalizedChildren
 ) {
   let slots: InternalSlots | void
   if (instance.vnode.shapeFlag & ShapeFlags.SLOTS_CHILDREN) {
@@ -54,6 +57,7 @@ export function resolveSlots(
     } else {
       slots = {}
       for (const key in rawSlots) {
+        if (key === '$stable') continue
         const value = rawSlots[key]
         if (isFunction(value)) {
           slots[key] = normalizeSlot(key, value)
@@ -71,7 +75,7 @@ export function resolveSlots(
     }
   } else if (children !== null) {
     // non slot object children (direct value) passed to a component
-    if (__DEV__) {
+    if (__DEV__ && !isKeepAlive(instance.vnode)) {
       warn(
         `Non-function value encountered for default slot. ` +
           `Prefer function slots for better performance.`
@@ -80,7 +84,5 @@ export function resolveSlots(
     const normalized = normalizeSlotValue(children)
     slots = { default: () => normalized }
   }
-  if (slots !== void 0) {
-    instance.slots = slots
-  }
+  instance.slots = slots || EMPTY_OBJ
 }

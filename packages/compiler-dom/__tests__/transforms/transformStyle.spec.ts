@@ -1,5 +1,5 @@
 import {
-  parse,
+  baseParse as parse,
   transform,
   CompilerOptions,
   ElementNode,
@@ -77,5 +77,7 @@ describe('compiler: style transform', () => {
         }
       ]
     })
+    // should not cause the STYLE patchFlag to be attached
+    expect((node.codegenNode as CallExpression).arguments.length).toBe(2)
   })
 })

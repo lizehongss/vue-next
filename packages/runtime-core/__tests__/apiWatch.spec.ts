@@ -1,18 +1,18 @@
-import {
-  watch,
-  reactive,
-  computed,
-  nextTick,
-  ref,
-  h,
-  OperationTypes
-} from '../src/index'
+import { watch, reactive, computed, nextTick, ref, h } from '../src/index'
 import { render, nodeOps, serializeInner } from '@vue/runtime-test'
-import { ITERATE_KEY, DebuggerEvent } from '@vue/reactivity'
+import {
+  ITERATE_KEY,
+  DebuggerEvent,
+  TrackOpTypes,
+  TriggerOpTypes
+} from '@vue/reactivity'
+import { mockWarn } from '@vue/shared'
 
 // reference: https://vue-composition-api-rfc.netlify.com/api.html#watch
 
 describe('api: watch', () => {
+  mockWarn()
+
   it('basic usage', async () => {
     const state = reactive({ count: 0 })
     let dummy
@@ -27,6 +27,33 @@ describe('api: watch', () => {
     expect(dummy).toBe(1)
   })
 
+  it('triggers when initial value is null', async () => {
+    const state = ref(null)
+    const spy = jest.fn()
+    watch(() => state.value, spy)
+    await nextTick()
+    expect(spy).toHaveBeenCalled()
+  })
+
+  it('triggers when initial value is undefined', async () => {
+    const state = ref()
+    const spy = jest.fn()
+    watch(() => state.value, spy)
+    await nextTick()
+    expect(spy).toHaveBeenCalled()
+    state.value = 3
+    await nextTick()
+    expect(spy).toHaveBeenCalledTimes(2)
+    // testing if undefined can trigger the watcher
+    state.value = undefined
+    await nextTick()
+    expect(spy).toHaveBeenCalledTimes(3)
+    // it shouldn't trigger if the same value is set
+    state.value = undefined
+    await nextTick()
+    expect(spy).toHaveBeenCalledTimes(3)
+  })
+
   it('watching single source: getter', async () => {
     const state = reactive({ count: 0 })
     let dummy
@@ -34,6 +61,9 @@ describe('api: watch', () => {
       () => state.count,
       (count, prevCount) => {
         dummy = [count, prevCount]
+        // assert types
+        count + 1
+        prevCount + 1
       }
     )
     await nextTick()
@@ -49,6 +79,9 @@ describe('api: watch', () => {
     let dummy
     watch(count, (count, prevCount) => {
       dummy = [count, prevCount]
+      // assert types
+      count + 1
+      prevCount + 1
     })
     await nextTick()
     expect(dummy).toMatchObject([0, undefined])
@@ -64,6 +97,9 @@ describe('api: watch', () => {
     let dummy
     watch(plus, (count, prevCount) => {
       dummy = [count, prevCount]
+      // assert types
+      count + 1
+      prevCount + 1
     })
     await nextTick()
     expect(dummy).toMatchObject([1, undefined])
@@ -81,6 +117,9 @@ describe('api: watch', () => {
     let dummy
     watch([() => state.count, count, plus], (vals, oldVals) => {
       dummy = [vals, oldVals]
+      // assert types
+      vals.concat(1)
+      oldVals.concat(1)
     })
     await nextTick()
     expect(dummy).toMatchObject([[1, 1, 2], []])
@@ -89,6 +128,28 @@ describe('api: watch', () => {
     count.value++
     await nextTick()
     expect(dummy).toMatchObject([[2, 2, 3], [1, 1, 2]])
+  })
+
+  it('watching multiple sources: readonly array', async () => {
+    const state = reactive({ count: 1 })
+    const status = ref(false)
+
+    let dummy
+    watch([() => state.count, status] as const, (vals, oldVals) => {
+      dummy = [vals, oldVals]
+      let [count] = vals
+      let [, oldStatus] = oldVals
+      // assert types
+      count + 1
+      oldStatus === true
+    })
+    await nextTick()
+    expect(dummy).toMatchObject([[1, false], []])
+
+    state.count++
+    status.value = true
+    await nextTick()
+    expect(dummy).toMatchObject([[2, true], [1, false]])
   })
 
   it('stopping the watcher', async () => {
@@ -313,6 +374,26 @@ describe('api: watch', () => {
     expect(cb).toHaveBeenCalled()
   })
 
+  it('ignore lazy option when using simple callback', async () => {
+    const count = ref(0)
+    let dummy
+    watch(
+      () => {
+        dummy = count.value
+      },
+      { lazy: true }
+    )
+    expect(dummy).toBeUndefined()
+    expect(`lazy option is only respected`).toHaveBeenWarned()
+
+    await nextTick()
+    expect(dummy).toBe(0)
+
+    count.value++
+    await nextTick()
+    expect(dummy).toBe(1)
+  })
+
   it('onTrack', async () => {
     const events: DebuggerEvent[] = []
     let dummy
@@ -332,17 +413,17 @@ describe('api: watch', () => {
     expect(events).toMatchObject([
       {
         target: obj,
-        type: OperationTypes.GET,
+        type: TrackOpTypes.GET,
         key: 'foo'
       },
       {
         target: obj,
-        type: OperationTypes.HAS,
+        type: TrackOpTypes.HAS,
         key: 'bar'
       },
       {
         target: obj,
-        type: OperationTypes.ITERATE,
+        type: TrackOpTypes.ITERATE,
         key: ITERATE_KEY
       }
     ])
@@ -369,7 +450,7 @@ describe('api: watch', () => {
     expect(dummy).toBe(2)
     expect(onTrigger).toHaveBeenCalledTimes(1)
     expect(events[0]).toMatchObject({
-      type: OperationTypes.SET,
+      type: TriggerOpTypes.SET,
       key: 'foo',
       oldValue: 1,
       newValue: 2
@@ -380,7 +461,7 @@ describe('api: watch', () => {
     expect(dummy).toBeUndefined()
     expect(onTrigger).toHaveBeenCalledTimes(2)
     expect(events[1]).toMatchObject({
-      type: OperationTypes.DELETE,
+      type: TriggerOpTypes.DELETE,
       key: 'foo',
       oldValue: 2
     })

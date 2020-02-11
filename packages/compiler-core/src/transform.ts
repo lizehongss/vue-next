@@ -1,3 +1,4 @@
+import { TransformOptions } from './options'
 import {
   RootNode,
   NodeTypes,
@@ -13,18 +14,26 @@ import {
   ElementTypes,
   ElementCodegenNode,
   ComponentCodegenNode,
-  createCallExpression
+  createCallExpression,
+  CacheExpression,
+  createCacheExpression,
+  TemplateLiteral
 } from './ast'
-import { isString, isArray } from '@vue/shared'
-import { CompilerError, defaultOnError } from './errors'
 import {
-  TO_STRING,
-  COMMENT,
-  CREATE_VNODE,
+  isString,
+  isArray,
+  NOOP,
+  PatchFlags,
+  PatchFlagNames
+} from '@vue/shared'
+import { defaultOnError } from './errors'
+import {
+  TO_DISPLAY_STRING,
   FRAGMENT,
   helperNameMap,
-  APPLY_DIRECTIVES,
-  CREATE_BLOCK
+  WITH_DIRECTIVES,
+  CREATE_BLOCK,
+  CREATE_COMMENT
 } from './runtimeHelpers'
 import { isVSlot, createBlockExpression } from './utils'
 import { hoistStatic, isSingleElementRoot } from './transforms/hoistStatic'
@@ -45,10 +54,16 @@ export type NodeTransform = (
 export type DirectiveTransform = (
   dir: DirectiveNode,
   node: ElementNode,
-  context: TransformContext
-) => {
+  context: TransformContext,
+  // a platform specific compiler can import the base transform and augment
+  // it by passing in this optional argument.
+  augmentor?: (ret: DirectiveTransformResult) => DirectiveTransformResult
+) => DirectiveTransformResult
+
+export interface DirectiveTransformResult {
   props: Property[]
-  needRuntime: boolean | symbol
+  needRuntime?: boolean | symbol
+  ssrTagParts?: TemplateLiteral['elements']
 }
 
 // A structural directive transform is a technically a NodeTransform;
@@ -59,12 +74,9 @@ export type StructuralDirectiveTransform = (
   context: TransformContext
 ) => void | (() => void)
 
-export interface TransformOptions {
-  nodeTransforms?: NodeTransform[]
-  directiveTransforms?: { [name: string]: DirectiveTransform }
-  prefixIdentifiers?: boolean
-  hoistStatic?: boolean
-  onError?: (error: CompilerError) => void
+export interface ImportItem {
+  exp: string | ExpressionNode
+  path: string
 }
 
 export interface TransformContext extends Required<TransformOptions> {
@@ -73,6 +85,9 @@ export interface TransformContext extends Required<TransformOptions> {
   components: Set<string>
   directives: Set<string>
   hoists: JSChildNode[]
+  imports: Set<ImportItem>
+  temps: number
+  cached: number
   identifiers: { [name: string]: number | undefined }
   scopes: {
     vFor: number
@@ -87,28 +102,48 @@ export interface TransformContext extends Required<TransformOptions> {
   helperString(name: symbol): string
   replaceNode(node: TemplateChildNode): void
   removeNode(node?: TemplateChildNode): void
-  onNodeRemoved: () => void
+  onNodeRemoved(): void
   addIdentifiers(exp: ExpressionNode | string): void
   removeIdentifiers(exp: ExpressionNode | string): void
   hoist(exp: JSChildNode): SimpleExpressionNode
+  cache<T extends JSChildNode>(exp: T, isVNode?: boolean): CacheExpression | T
 }
 
-function createTransformContext(
+export function createTransformContext(
   root: RootNode,
   {
     prefixIdentifiers = false,
     hoistStatic = false,
+    cacheHandlers = false,
     nodeTransforms = [],
     directiveTransforms = {},
+    isBuiltInComponent = NOOP,
+    scopeId = null,
+    ssr = false,
     onError = defaultOnError
   }: TransformOptions
 ): TransformContext {
   const context: TransformContext = {
+    // options
+    prefixIdentifiers,
+    hoistStatic,
+    cacheHandlers,
+    nodeTransforms,
+    directiveTransforms,
+    isBuiltInComponent,
+    scopeId,
+    ssr,
+    onError,
+
+    // state
     root,
     helpers: new Set(),
     components: new Set(),
     directives: new Set(),
     hoists: [],
+    imports: new Set(),
+    temps: 0,
+    cached: 0,
     identifiers: {},
     scopes: {
       vFor: 0,
@@ -116,14 +151,11 @@ function createTransformContext(
       vPre: 0,
       vOnce: 0
     },
-    prefixIdentifiers,
-    hoistStatic,
-    nodeTransforms,
-    directiveTransforms,
-    onError,
     parent: null,
     currentNode: root,
     childIndex: 0,
+
+    // methods
     helper(name) {
       context.helpers.add(name)
       return name
@@ -202,8 +234,12 @@ function createTransformContext(
       return createSimpleExpression(
         `_hoisted_${context.hoists.length}`,
         false,
-        exp.loc
+        exp.loc,
+        true
       )
+    },
+    cache(exp, isVNode = false) {
+      return createCacheExpression(++context.cached, exp, isVNode)
     }
   }
 
@@ -228,10 +264,20 @@ export function transform(root: RootNode, options: TransformOptions) {
   if (options.hoistStatic) {
     hoistStatic(root, context)
   }
-  finalizeRoot(root, context)
+  if (!options.ssr) {
+    createRootCodegen(root, context)
+  }
+  // finalize meta information
+  root.helpers = [...context.helpers]
+  root.components = [...context.components]
+  root.directives = [...context.directives]
+  root.imports = [...context.imports]
+  root.hoists = context.hoists
+  root.temps = context.temps
+  root.cached = context.cached
 }
 
-function finalizeRoot(root: RootNode, context: TransformContext) {
+function createRootCodegen(root: RootNode, context: TransformContext) {
   const { helper } = context
   const { children } = root
   const child = children[0]
@@ -243,12 +289,17 @@ function finalizeRoot(root: RootNode, context: TransformContext) {
       const codegenNode = child.codegenNode as
         | ElementCodegenNode
         | ComponentCodegenNode
-      if (codegenNode.callee === APPLY_DIRECTIVES) {
-        codegenNode.arguments[0].callee = helper(CREATE_BLOCK)
+        | CacheExpression
+      if (codegenNode.type !== NodeTypes.JS_CACHE_EXPRESSION) {
+        if (codegenNode.callee === WITH_DIRECTIVES) {
+          codegenNode.arguments[0].callee = helper(CREATE_BLOCK)
+        } else {
+          codegenNode.callee = helper(CREATE_BLOCK)
+        }
+        root.codegenNode = createBlockExpression(codegenNode, context)
       } else {
-        codegenNode.callee = helper(CREATE_BLOCK)
+        root.codegenNode = codegenNode
       }
-      root.codegenNode = createBlockExpression(codegenNode, context)
     } else {
       // - single <slot/>, IfNode, ForNode: already blocks.
       // - single text node: always patched.
@@ -261,18 +312,16 @@ function finalizeRoot(root: RootNode, context: TransformContext) {
       createCallExpression(helper(CREATE_BLOCK), [
         helper(FRAGMENT),
         `null`,
-        root.children
+        root.children,
+        `${PatchFlags.STABLE_FRAGMENT} /* ${
+          PatchFlagNames[PatchFlags.STABLE_FRAGMENT]
+        } */`
       ]),
       context
     )
   } else {
     // no children = noop. codegen will return null.
   }
-  // finalize meta information
-  root.helpers = [...context.helpers]
-  root.components = [...context.components]
-  root.directives = [...context.directives]
-  root.hoists = context.hoists
 }
 
 export function traverseChildren(
@@ -321,14 +370,17 @@ export function traverseNode(
 
   switch (node.type) {
     case NodeTypes.COMMENT:
-      // inject import for the Comment symbol, which is needed for creating
-      // comment nodes with `createVNode`
-      context.helper(CREATE_VNODE)
-      context.helper(COMMENT)
+      if (!context.ssr) {
+        // inject import for the Comment symbol, which is needed for creating
+        // comment nodes with `createVNode`
+        context.helper(CREATE_COMMENT)
+      }
       break
     case NodeTypes.INTERPOLATION:
       // no need to traverse, but we need to inject toString helper
-      context.helper(TO_STRING)
+      if (!context.ssr) {
+        context.helper(TO_DISPLAY_STRING)
+      }
       break
 
     // for container types, further traverse downwards

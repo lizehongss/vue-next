@@ -21,13 +21,39 @@ import {
   ElementCodegenNode,
   SlotOutletCodegenNode,
   ComponentCodegenNode,
-  ExpressionNode
+  ExpressionNode,
+  IfBranchNode,
+  TextNode,
+  InterpolationNode
 } from './ast'
 import { parse } from 'acorn'
 import { walk } from 'estree-walker'
 import { TransformContext } from './transform'
-import { OPEN_BLOCK, MERGE_PROPS, RENDER_SLOT } from './runtimeHelpers'
-import { isString, isFunction } from '@vue/shared'
+import {
+  OPEN_BLOCK,
+  MERGE_PROPS,
+  RENDER_SLOT,
+  PORTAL,
+  SUSPENSE,
+  KEEP_ALIVE,
+  BASE_TRANSITION
+} from './runtimeHelpers'
+import { isString, isFunction, isObject, hyphenate } from '@vue/shared'
+
+export const isBuiltInType = (tag: string, expected: string): boolean =>
+  tag === expected || tag === hyphenate(expected)
+
+export function isCoreComponent(tag: string): symbol | void {
+  if (isBuiltInType(tag, 'Portal')) {
+    return PORTAL
+  } else if (isBuiltInType(tag, 'Suspense')) {
+    return SUSPENSE
+  } else if (isBuiltInType(tag, 'KeepAlive')) {
+    return KEEP_ALIVE
+  } else if (isBuiltInType(tag, 'BaseTransition')) {
+    return BASE_TRANSITION
+  }
+}
 
 // cache node requires
 // lazy require dependencies so that they don't end up in rollup's dep graph
@@ -36,7 +62,7 @@ let _parse: typeof parse
 let _walk: typeof walk
 
 export function loadDep(name: string) {
-  if (typeof process !== 'undefined' && isFunction(require)) {
+  if (!__BROWSER__ && typeof process !== 'undefined' && isFunction(require)) {
     return require(name)
   } else {
     // This is only used when we are building a dev-only build of the compiler
@@ -76,7 +102,7 @@ export function getInnerRange(
   offset: number,
   length?: number
 ): SourceLocation {
-  __DEV__ && assert(offset <= loc.source.length)
+  __TEST__ && assert(offset <= loc.source.length)
   const source = loc.source.substr(offset, length)
   const newLoc: SourceLocation = {
     source,
@@ -85,7 +111,7 @@ export function getInnerRange(
   }
 
   if (length != null) {
-    __DEV__ && assert(offset + length <= loc.source.length)
+    __TEST__ && assert(offset + length <= loc.source.length)
     newLoc.end = advancePositionWithClone(
       loc.start,
       loc.source,
@@ -125,7 +151,7 @@ export function advancePositionWithMutation(
   pos.column =
     lastNewLinePos === -1
       ? pos.column + numberOfCharacters
-      : Math.max(1, numberOfCharacters - lastNewLinePos)
+      : numberOfCharacters - lastNewLinePos
 
   return pos
 }
@@ -156,24 +182,40 @@ export function findDir(
 
 export function findProp(
   node: ElementNode,
-  name: string
+  name: string,
+  dynamicOnly: boolean = false
 ): ElementNode['props'][0] | undefined {
   for (let i = 0; i < node.props.length; i++) {
     const p = node.props[i]
     if (p.type === NodeTypes.ATTRIBUTE) {
-      if (p.name === name && p.value && !p.value.isEmpty) {
+      if (dynamicOnly) continue
+      if (p.name === name && p.value) {
         return p
       }
-    } else if (
-      p.arg &&
-      p.arg.type === NodeTypes.SIMPLE_EXPRESSION &&
-      p.arg.isStatic &&
-      p.arg.content === name &&
-      p.exp
-    ) {
+    } else if (p.name === 'bind' && p.exp && isBindKey(p.arg, name)) {
       return p
     }
   }
+}
+
+export function isBindKey(arg: DirectiveNode['arg'], name: string): boolean {
+  return !!(
+    arg &&
+    arg.type === NodeTypes.SIMPLE_EXPRESSION &&
+    arg.isStatic &&
+    arg.content === name
+  )
+}
+
+export function hasDynamicKeyVBind(node: ElementNode): boolean {
+  return node.props.some(
+    p =>
+      p.type === NodeTypes.DIRECTIVE &&
+      p.name === 'bind' &&
+      (!p.arg || // v-bind="obj"
+      p.arg.type !== NodeTypes.SIMPLE_EXPRESSION || // v-bind:[_ctx.foo]
+        !p.arg.isStatic) // v-bind:[foo]
+  )
 }
 
 export function createBlockExpression(
@@ -186,18 +228,29 @@ export function createBlockExpression(
   ])
 }
 
-export const isVSlot = (p: ElementNode['props'][0]): p is DirectiveNode =>
-  p.type === NodeTypes.DIRECTIVE && p.name === 'slot'
+export function isText(
+  node: TemplateChildNode
+): node is TextNode | InterpolationNode {
+  return node.type === NodeTypes.INTERPOLATION || node.type === NodeTypes.TEXT
+}
 
-export const isTemplateNode = (
-  node: RootNode | TemplateChildNode
-): node is TemplateNode =>
-  node.type === NodeTypes.ELEMENT && node.tagType === ElementTypes.TEMPLATE
+export function isVSlot(p: ElementNode['props'][0]): p is DirectiveNode {
+  return p.type === NodeTypes.DIRECTIVE && p.name === 'slot'
+}
 
-export const isSlotOutlet = (
+export function isTemplateNode(
   node: RootNode | TemplateChildNode
-): node is SlotOutletNode =>
-  node.type === NodeTypes.ELEMENT && node.tagType === ElementTypes.SLOT
+): node is TemplateNode {
+  return (
+    node.type === NodeTypes.ELEMENT && node.tagType === ElementTypes.TEMPLATE
+  )
+}
+
+export function isSlotOutlet(
+  node: RootNode | TemplateChildNode
+): node is SlotOutletNode {
+  return node.type === NodeTypes.ELEMENT && node.tagType === ElementTypes.SLOT
+}
 
 export function injectProp(
   node: ElementCodegenNode | ComponentCodegenNode | SlotOutletCodegenNode,
@@ -221,7 +274,19 @@ export function injectProp(
     }
     propsWithInjection = props
   } else if (props.type === NodeTypes.JS_OBJECT_EXPRESSION) {
-    props.properties.unshift(prop)
+    let alreadyExists = false
+    // check existing key to avoid overriding user provided keys
+    if (prop.key.type === NodeTypes.SIMPLE_EXPRESSION) {
+      const propKeyName = prop.key.content
+      alreadyExists = props.properties.some(
+        p =>
+          p.key.type === NodeTypes.SIMPLE_EXPRESSION &&
+          p.key.content === propKeyName
+      )
+    }
+    if (!alreadyExists) {
+      props.properties.unshift(prop)
+    }
     propsWithInjection = props
   } else {
     // single v-bind with expression, return a merged replacement
@@ -244,6 +309,57 @@ export function toValidAssetId(
   return `_${type}_${name.replace(/[^\w]/g, '_')}`
 }
 
-export function isEmptyExpression(node: ExpressionNode) {
-  return node.type === NodeTypes.SIMPLE_EXPRESSION && !node.content.trim()
+// Check if a node contains expressions that reference current context scope ids
+export function hasScopeRef(
+  node: TemplateChildNode | IfBranchNode | ExpressionNode | undefined,
+  ids: TransformContext['identifiers']
+): boolean {
+  if (!node || Object.keys(ids).length === 0) {
+    return false
+  }
+  switch (node.type) {
+    case NodeTypes.ELEMENT:
+      for (let i = 0; i < node.props.length; i++) {
+        const p = node.props[i]
+        if (
+          p.type === NodeTypes.DIRECTIVE &&
+          (hasScopeRef(p.arg, ids) || hasScopeRef(p.exp, ids))
+        ) {
+          return true
+        }
+      }
+      return node.children.some(c => hasScopeRef(c, ids))
+    case NodeTypes.FOR:
+      if (hasScopeRef(node.source, ids)) {
+        return true
+      }
+      return node.children.some(c => hasScopeRef(c, ids))
+    case NodeTypes.IF:
+      return node.branches.some(b => hasScopeRef(b, ids))
+    case NodeTypes.IF_BRANCH:
+      if (hasScopeRef(node.condition, ids)) {
+        return true
+      }
+      return node.children.some(c => hasScopeRef(c, ids))
+    case NodeTypes.SIMPLE_EXPRESSION:
+      return (
+        !node.isStatic &&
+        isSimpleIdentifier(node.content) &&
+        !!ids[node.content]
+      )
+    case NodeTypes.COMPOUND_EXPRESSION:
+      return node.children.some(c => isObject(c) && hasScopeRef(c, ids))
+    case NodeTypes.INTERPOLATION:
+    case NodeTypes.TEXT_CALL:
+      return hasScopeRef(node.content, ids)
+    case NodeTypes.TEXT:
+    case NodeTypes.COMMENT:
+      return false
+    default:
+      if (__DEV__) {
+        const exhaustiveCheck: never = node
+        exhaustiveCheck
+      }
+      return false
+  }
 }

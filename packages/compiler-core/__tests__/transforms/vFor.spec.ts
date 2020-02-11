@@ -1,4 +1,4 @@
-import { parse } from '../../src/parse'
+import { baseParse as parse } from '../../src/parse'
 import { transform } from '../../src/transform'
 import { transformIf } from '../../src/transforms/vIf'
 import { transformFor } from '../../src/transforms/vFor'
@@ -13,7 +13,8 @@ import {
   ElementNode,
   InterpolationNode,
   CallExpression,
-  SequenceExpression
+  SequenceExpression,
+  ForCodegenNode
 } from '../../src/ast'
 import { ErrorCodes } from '../../src/errors'
 import { CompilerOptions, generate } from '../../src'
@@ -23,9 +24,9 @@ import {
   FRAGMENT,
   RENDER_LIST,
   RENDER_SLOT,
-  APPLY_DIRECTIVES
+  WITH_DIRECTIVES
 } from '../../src/runtimeHelpers'
-import { PatchFlags } from '@vue/runtime-dom'
+import { PatchFlags } from '@vue/shared'
 import { createObjectMatcher, genFlagText } from '../testUtils'
 
 function parseWithForTransform(
@@ -48,7 +49,7 @@ function parseWithForTransform(
   })
   return {
     root: ast,
-    node: ast.children[0] as ForNode
+    node: ast.children[0] as ForNode & { codegenNode: ForCodegenNode }
   }
 }
 
@@ -704,7 +705,8 @@ describe('compiler: v-for', () => {
           [
             { type: NodeTypes.TEXT, content: `hello` },
             { type: NodeTypes.ELEMENT, tag: `span` }
-          ]
+          ],
+          genFlagText(PatchFlags.STABLE_FRAGMENT)
         ]
       })
       expect(generate(root).code).toMatchSnapshot()
@@ -784,7 +786,8 @@ describe('compiler: v-for', () => {
           [
             { type: NodeTypes.TEXT, content: `hello` },
             { type: NodeTypes.ELEMENT, tag: `span` }
-          ]
+          ],
+          genFlagText(PatchFlags.STABLE_FRAGMENT)
         ]
       })
       expect(generate(root).code).toMatchSnapshot()
@@ -857,9 +860,9 @@ describe('compiler: v-for', () => {
         type: NodeTypes.JS_SEQUENCE_EXPRESSION,
         expressions: [
           { callee: OPEN_BLOCK },
-          // should wrap applyDirectives() around createBlock()
+          // should wrap withDirectives() around createBlock()
           {
-            callee: APPLY_DIRECTIVES,
+            callee: WITH_DIRECTIVES,
             arguments: [
               { callee: CREATE_BLOCK },
               { type: NodeTypes.JS_ARRAY_EXPRESSION }

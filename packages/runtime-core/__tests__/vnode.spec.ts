@@ -1,4 +1,4 @@
-import { createVNode } from '@vue/runtime-test'
+import { createBlock, createVNode, openBlock } from '@vue/runtime-test'
 import {
   ShapeFlags,
   Comment,
@@ -120,6 +120,12 @@ describe('vnode', () => {
     expect(normalizeVNode(null)).toMatchObject({ type: Comment })
     expect(normalizeVNode(undefined)).toMatchObject({ type: Comment })
 
+    // boolean -> Comment
+    // this is for usage like `someBoolean && h('div')` and behavior consistency
+    // with 2.x (#574)
+    expect(normalizeVNode(true)).toMatchObject({ type: Comment })
+    expect(normalizeVNode(false)).toMatchObject({ type: Comment })
+
     // array -> Fragment
     expect(normalizeVNode(['foo'])).toMatchObject({ type: Fragment })
 
@@ -132,12 +138,11 @@ describe('vnode', () => {
     mounted.el = {}
     const normalized = normalizeVNode(mounted)
     expect(normalized).not.toBe(mounted)
-    expect(normalized).toEqual({ ...mounted, el: null })
+    expect(normalized).toEqual(mounted)
 
     // primitive types
     expect(normalizeVNode('foo')).toMatchObject({ type: Text, children: `foo` })
     expect(normalizeVNode(1)).toMatchObject({ type: Text, children: `1` })
-    expect(normalizeVNode(true)).toMatchObject({ type: Text, children: `true` })
   })
 
   test('type shapeFlag inference', () => {
@@ -158,20 +163,6 @@ describe('vnode', () => {
     expect(cloned2).toEqual(node2)
     expect(cloneVNode(node2)).toEqual(node2)
     expect(cloneVNode(node2)).toEqual(cloned2)
-
-    // should reset mounted state
-    const node3 = createVNode('div', { foo: 1 }, [node1])
-    node3.el = {}
-    node3.anchor = {}
-    node3.component = {} as any
-    node3.suspense = {} as any
-    expect(cloneVNode(node3)).toEqual({
-      ...node3,
-      el: null,
-      anchor: null,
-      component: null,
-      suspense: null
-    })
   })
 
   describe('mergeProps', () => {
@@ -196,10 +187,10 @@ describe('vnode', () => {
         style: [
           {
             color: 'blue',
-            with: '200px'
+            width: '200px'
           },
           {
-            with: '300px',
+            width: '300px',
             height: '300px',
             fontSize: 30
           }
@@ -208,7 +199,7 @@ describe('vnode', () => {
       expect(mergeProps(props1, props2)).toMatchObject({
         style: {
           color: 'blue',
-          with: '300px',
+          width: '300px',
           height: '300px',
           fontSize: 30
         }
@@ -237,6 +228,69 @@ describe('vnode', () => {
         bar: ['cc'],
         baz: { ccc: true }
       })
+    })
+  })
+
+  describe('dynamic children', () => {
+    test('with patchFlags', () => {
+      const hoist = createVNode('div')
+      let vnode1
+      const vnode = (openBlock(),
+      createBlock('div', null, [
+        hoist,
+        (vnode1 = createVNode('div', null, 'text', 1 /* TEXT */))
+      ]))
+      expect(vnode.dynamicChildren).toStrictEqual([vnode1])
+    })
+
+    test('many times call openBlock', () => {
+      const hoist = createVNode('div')
+      let vnode1, vnode2, vnode3
+      const vnode = (openBlock(),
+      createBlock('div', null, [
+        hoist,
+        (vnode1 = createVNode('div', null, 'text', 1 /* TEXT */)),
+        (vnode2 = (openBlock(),
+        createBlock('div', null, [
+          hoist,
+          (vnode3 = createVNode('div', null, 'text', 1 /* TEXT */))
+        ])))
+      ]))
+      expect(vnode.dynamicChildren).toStrictEqual([vnode1, vnode2])
+      expect(vnode2.dynamicChildren).toStrictEqual([vnode3])
+    })
+
+    test('with stateful component', () => {
+      const hoist = createVNode('div')
+      let vnode1
+      const vnode = (openBlock(),
+      createBlock('div', null, [
+        hoist,
+        (vnode1 = createVNode({}, null, 'text'))
+      ]))
+      expect(vnode.dynamicChildren).toStrictEqual([vnode1])
+    })
+
+    test('with functional component', () => {
+      const hoist = createVNode('div')
+      let vnode1
+      const vnode = (openBlock(),
+      createBlock('div', null, [
+        hoist,
+        (vnode1 = createVNode(() => {}, null, 'text'))
+      ]))
+      expect(vnode.dynamicChildren).toStrictEqual([vnode1])
+    })
+
+    test('with suspense', () => {
+      const hoist = createVNode('div')
+      let vnode1
+      const vnode = (openBlock(),
+      createBlock('div', null, [
+        hoist,
+        (vnode1 = createVNode(() => {}, null, 'text'))
+      ]))
+      expect(vnode.dynamicChildren).toStrictEqual([vnode1])
     })
   })
 })

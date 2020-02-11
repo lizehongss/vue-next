@@ -1,13 +1,14 @@
 import {
   CompilerOptions,
-  parse,
+  baseParse as parse,
   transform,
   generate,
   ElementNode,
   NodeTypes,
   ErrorCodes,
   ForNode,
-  CallExpression
+  CallExpression,
+  ComponentNode
 } from '../../src'
 import { transformElement } from '../../src/transforms/transformElement'
 import { transformOn } from '../../src/transforms/vOn'
@@ -32,8 +33,8 @@ function parseWithSlots(template: string, options: CompilerOptions = {}) {
       ...(options.prefixIdentifiers
         ? [trackVForSlotScopes, transformExpression]
         : []),
-      trackSlotScopes,
-      transformElement
+      transformElement,
+      trackSlotScopes
     ],
     directiveTransforms: {
       on: transformOn,
@@ -94,7 +95,7 @@ describe('compiler: transform component slots', () => {
     expect(generate(root, { prefixIdentifiers: true }).code).toMatchSnapshot()
   })
 
-  test('explicit default slot', () => {
+  test('on-component default slot', () => {
     const { root, slots } = parseWithSlots(
       `<Comp v-slot="{ foo }">{{ foo }}{{ bar }}</Comp>`,
       { prefixIdentifiers: true }
@@ -186,6 +187,43 @@ describe('compiler: transform component slots', () => {
       })
     )
     expect(generate(root, { prefixIdentifiers: true }).code).toMatchSnapshot()
+  })
+
+  test('named slots w/ implicit default slot', () => {
+    const { root, slots } = parseWithSlots(
+      `<Comp>
+        <template #one>foo</template>bar<span/>
+      </Comp>`
+    )
+    expect(slots).toMatchObject(
+      createSlotMatcher({
+        one: {
+          type: NodeTypes.JS_FUNCTION_EXPRESSION,
+          params: undefined,
+          returns: [
+            {
+              type: NodeTypes.TEXT,
+              content: `foo`
+            }
+          ]
+        },
+        default: {
+          type: NodeTypes.JS_FUNCTION_EXPRESSION,
+          params: undefined,
+          returns: [
+            {
+              type: NodeTypes.TEXT,
+              content: `bar`
+            },
+            {
+              type: NodeTypes.ELEMENT,
+              tag: `span`
+            }
+          ]
+        }
+      })
+    )
+    expect(generate(root).code).toMatchSnapshot()
   })
 
   test('dynamically named slots', () => {
@@ -314,6 +352,10 @@ describe('compiler: transform component slots', () => {
             },
             // test scope
             {
+              type: NodeTypes.TEXT,
+              content: ` `
+            },
+            {
               type: NodeTypes.INTERPOLATION,
               content: {
                 content: `foo`
@@ -347,7 +389,60 @@ describe('compiler: transform component slots', () => {
     const div = ((root.children[0] as ForNode).children[0] as ElementNode)
       .codegenNode as any
     const comp = div.arguments[2][0]
-    expect(comp.codegenNode.arguments[3]).toMatch(PatchFlags.DYNAMIC_SLOTS + '')
+    expect(comp.codegenNode.arguments[3]).toBe(
+      genFlagText(PatchFlags.DYNAMIC_SLOTS)
+    )
+  })
+
+  test('should only force dynamic slots when actually using scope vars w/ prefixIdentifiers: true', () => {
+    function assertDynamicSlots(template: string, shouldForce: boolean) {
+      const { root } = parseWithSlots(template, { prefixIdentifiers: true })
+      let flag: any
+      if (root.children[0].type === NodeTypes.FOR) {
+        const div = (root.children[0].children[0] as ElementNode)
+          .codegenNode as any
+        const comp = div.arguments[2][0]
+        flag = comp.codegenNode.arguments[3]
+      } else {
+        const innerComp = (root.children[0] as ComponentNode)
+          .children[0] as ComponentNode
+        flag = (innerComp.codegenNode as CallExpression).arguments[3]
+      }
+      if (shouldForce) {
+        expect(flag).toBe(genFlagText(PatchFlags.DYNAMIC_SLOTS))
+      } else {
+        expect(flag).toBeUndefined()
+      }
+    }
+
+    assertDynamicSlots(
+      `<div v-for="i in list">
+        <Comp v-slot="bar">foo</Comp>
+      </div>`,
+      false
+    )
+
+    assertDynamicSlots(
+      `<div v-for="i in list">
+        <Comp v-slot="bar">{{ i }}</Comp>
+      </div>`,
+      true
+    )
+
+    // reference the component's own slot variable should not force dynamic slots
+    assertDynamicSlots(
+      `<Comp v-slot="foo">
+        <Comp v-slot="bar">{{ bar }}</Comp>
+      </Comp>`,
+      false
+    )
+
+    assertDynamicSlots(
+      `<Comp v-slot="foo">
+        <Comp v-slot="bar">{{ foo }}</Comp>
+      </Comp>`,
+      true
+    )
   })
 
   test('named slot with v-if', () => {
@@ -550,13 +645,13 @@ describe('compiler: transform component slots', () => {
   })
 
   describe('errors', () => {
-    test('error on extraneous children w/ named slots', () => {
+    test('error on extraneous children w/ named default slot', () => {
       const onError = jest.fn()
       const source = `<Comp><template #default>foo</template>bar</Comp>`
       parseWithSlots(source, { onError })
       const index = source.indexOf('bar')
       expect(onError.mock.calls[0][0]).toMatchObject({
-        code: ErrorCodes.X_V_SLOT_EXTRANEOUS_NON_SLOT_CHILDREN,
+        code: ErrorCodes.X_V_SLOT_EXTRANEOUS_DEFAULT_SLOT_CHILDREN,
         loc: {
           source: `bar`,
           start: {

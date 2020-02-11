@@ -2,8 +2,10 @@ export { ref, isRef, toRefs, Ref, UnwrapRef } from './ref'
 export {
   reactive,
   isReactive,
+  shallowReactive,
   readonly,
   isReadonly,
+  shallowReadonly,
   toRaw,
   markReadonly,
   markNonReactive
@@ -12,7 +14,9 @@ export {
   computed,
   ComputedRef,
   WritableComputedRef,
-  WritableComputedOptions
+  WritableComputedOptions,
+  ComputedGetter,
+  ComputedSetter
 } from './computed'
 export {
   effect,
@@ -25,4 +29,4 @@ export {
   DebuggerEvent
 } from './effect'
 export { lock, unlock } from './lock'
-export { OperationTypes } from './operations'
+export { TrackOpTypes, TriggerOpTypes } from './operations'

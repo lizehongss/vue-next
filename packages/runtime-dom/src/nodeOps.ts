@@ -1,4 +1,4 @@
-const doc = document
+const doc = (typeof document !== 'undefined' ? document : null) as Document
 const svgNS = 'http://www.w3.org/2000/svg'
 
 export const nodeOps = {
@@ -38,5 +38,9 @@ export const nodeOps = {
   nextSibling: (node: Node): Node | null => node.nextSibling,
 
   querySelector: (selector: string): Element | null =>
-    doc.querySelector(selector)
+    doc.querySelector(selector),
+
+  setScopeId(el: Element, id: string) {
+    el.setAttribute(id, '')
+  }
 }

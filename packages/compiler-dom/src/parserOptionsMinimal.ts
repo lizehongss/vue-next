@@ -3,9 +3,16 @@ import {
   ParserOptions,
   ElementNode,
   Namespaces,
-  NodeTypes
+  NodeTypes,
+  isBuiltInType
 } from '@vue/compiler-core'
-import { isVoidTag, isHTMLTag, isSVGTag } from '@vue/shared'
+import { makeMap, isVoidTag, isHTMLTag, isSVGTag } from '@vue/shared'
+import { TRANSITION, TRANSITION_GROUP } from './runtimeHelpers'
+
+const isRawTextContainer = /*#__PURE__*/ makeMap(
+  'style,iframe,script,noscript',
+  true
+)
 
 export const enum DOMNamespaces {
   HTML = Namespaces.HTML,
@@ -15,8 +22,16 @@ export const enum DOMNamespaces {
 
 export const parserOptionsMinimal: ParserOptions = {
   isVoidTag,
-
   isNativeTag: tag => isHTMLTag(tag) || isSVGTag(tag),
+  isPreTag: tag => tag === 'pre',
+
+  isBuiltInComponent: (tag: string): symbol | undefined => {
+    if (isBuiltInType(tag, `Transition`)) {
+      return TRANSITION
+    } else if (isBuiltInType(tag, `TransitionGroup`)) {
+      return TRANSITION_GROUP
+    }
+  },
 
   // https://html.spec.whatwg.org/multipage/parsing.html#tree-construction-dispatcher
   getNamespace(tag: string, parent: ElementNode | undefined): DOMNamespaces {
@@ -73,9 +88,7 @@ export const parserOptionsMinimal: ParserOptions = {
       if (tag === 'textarea' || tag === 'title') {
         return TextModes.RCDATA
       }
-      if (
-        /^(?:style|xmp|iframe|noembed|noframes|script|noscript)$/i.test(tag)
-      ) {
+      if (isRawTextContainer(tag)) {
         return TextModes.RAWTEXT
       }
     }

@@ -1,22 +1,31 @@
-import { Component, Data, validateComponentName } from './component'
-import { ComponentOptions } from './apiOptions'
+import {
+  Component,
+  Data,
+  validateComponentName,
+  PublicAPIComponent
+} from './component'
+import { ComponentOptions } from './componentOptions'
 import { ComponentPublicInstance } from './componentProxy'
 import { Directive, validateDirectiveName } from './directives'
 import { RootRenderFunction } from './renderer'
 import { InjectionKey } from './apiInject'
 import { isFunction, NO, isObject } from '@vue/shared'
 import { warn } from './warning'
-import { createVNode, cloneVNode } from './vnode'
+import { createVNode, cloneVNode, VNode } from './vnode'
+import { RootHydrateFunction } from './hydration'
 
 export interface App<HostElement = any> {
   config: AppConfig
   use(plugin: Plugin, ...options: any[]): this
   mixin(mixin: ComponentOptions): this
-  component(name: string): Component | undefined
-  component(name: string, component: Component): this
+  component(name: string): PublicAPIComponent | undefined
+  component(name: string, component: PublicAPIComponent): this
   directive(name: string): Directive | undefined
   directive(name: string, directive: Directive): this
-  mount(rootContainer: HostElement | string): ComponentPublicInstance
+  mount(
+    rootContainer: HostElement | string,
+    isHydrate?: boolean
+  ): ComponentPublicInstance
   unmount(rootContainer: HostElement | string): void
   provide<T>(key: InjectionKey<T> | string, value: T): this
 
@@ -27,13 +36,24 @@ export interface App<HostElement = any> {
   _context: AppContext
 }
 
+export type OptionMergeFunction = (
+  to: unknown,
+  from: unknown,
+  instance: any,
+  key: string
+) => any
+
 export interface AppConfig {
+  // @private
+  readonly isNativeTag?: (tag: string) => boolean
+
   devtools: boolean
   performance: boolean
-  readonly isNativeTag?: (tag: string) => boolean
-  isCustomElement?: (tag: string) => boolean
+  optionMergeStrategies: Record<string, OptionMergeFunction>
+  globalProperties: Record<string, any>
+  isCustomElement: (tag: string) => boolean
   errorHandler?: (
-    err: Error,
+    err: unknown,
     instance: ComponentPublicInstance | null,
     info: string
   ) => void
@@ -47,7 +67,7 @@ export interface AppConfig {
 export interface AppContext {
   config: AppConfig
   mixins: ComponentOptions[]
-  components: Record<string, Component>
+  components: Record<string, PublicAPIComponent>
   directives: Record<string, Directive>
   provides: Record<string | symbol, any>
   reload?: () => void // HMR only
@@ -64,9 +84,11 @@ export type Plugin =
 export function createAppContext(): AppContext {
   return {
     config: {
+      isNativeTag: NO,
       devtools: true,
       performance: false,
-      isNativeTag: NO,
+      globalProperties: {},
+      optionMergeStrategies: {},
       isCustomElement: NO,
       errorHandler: undefined,
       warnHandler: undefined
@@ -74,22 +96,20 @@ export function createAppContext(): AppContext {
     mixins: [],
     components: {},
     directives: {},
-    provides: {}
+    provides: Object.create(null)
   }
 }
 
 export type CreateAppFunction<HostElement> = (
-  rootComponent:
-    | Component
-    // for compatibility with defineComponent() return types
-    | { new (): ComponentPublicInstance<any, any, any, any, any> },
+  rootComponent: PublicAPIComponent,
   rootProps?: Data | null
 ) => App<HostElement>
 
-export function createAppAPI<HostNode, HostElement>(
-  render: RootRenderFunction<HostNode, HostElement>
+export function createAppAPI<HostElement>(
+  render: RootRenderFunction,
+  hydrate?: RootHydrateFunction
 ): CreateAppFunction<HostElement> {
-  return function createApp(rootComponent: Component, rootProps = null) {
+  return function createApp(rootComponent, rootProps = null) {
     if (rootProps != null && !isObject(rootProps)) {
       __DEV__ && warn(`root props passed to app.mount() must be an object.`)
       rootProps = null
@@ -101,7 +121,7 @@ export function createAppAPI<HostNode, HostElement>(
     let isMounted = false
 
     const app: App = {
-      _component: rootComponent,
+      _component: rootComponent as Component,
       _props: rootProps,
       _container: null,
       _context: context,
@@ -137,23 +157,22 @@ export function createAppAPI<HostNode, HostElement>(
       },
 
       mixin(mixin: ComponentOptions) {
-        if (__DEV__ && !__FEATURE_OPTIONS__) {
+        if (__FEATURE_OPTIONS__) {
+          if (!context.mixins.includes(mixin)) {
+            context.mixins.push(mixin)
+          } else if (__DEV__) {
+            warn(
+              'Mixin has already been applied to target app' +
+                (mixin.name ? `: ${mixin.name}` : '')
+            )
+          }
+        } else if (__DEV__) {
           warn('Mixins are only available in builds supporting Options API')
         }
-
-        if (!context.mixins.includes(mixin)) {
-          context.mixins.push(mixin)
-        } else if (__DEV__) {
-          warn(
-            'Mixin has already been applied to target app' +
-              (mixin.name ? `: ${mixin.name}` : '')
-          )
-        }
-
         return app
       },
 
-      component(name: string, component?: Component): any {
+      component(name: string, component?: PublicAPIComponent): any {
         if (__DEV__) {
           validateComponentName(name, context.config)
         }
@@ -182,21 +201,25 @@ export function createAppAPI<HostNode, HostElement>(
         return app
       },
 
-      mount(rootContainer: HostElement): any {
+      mount(rootContainer: HostElement, isHydrate?: boolean): any {
         if (!isMounted) {
-          const vnode = createVNode(rootComponent, rootProps)
+          const vnode = createVNode(rootComponent as Component, rootProps)
           // store app context on the root VNode.
           // this will be set on the root instance on initial mount.
           vnode.appContext = context
 
           // HMR root reload
-          if (__BUNDLER__ && __DEV__) {
+          if (__DEV__) {
             context.reload = () => {
               render(cloneVNode(vnode), rootContainer)
             }
           }
 
-          render(vnode, rootContainer)
+          if (isHydrate && hydrate) {
+            hydrate(vnode as VNode<Node, Element>, rootContainer as any)
+          } else {
+            render(vnode, rootContainer)
+          }
           isMounted = true
           app._container = rootContainer
           return vnode.component!.proxy
@@ -209,7 +232,7 @@ export function createAppAPI<HostNode, HostElement>(
 
       unmount() {
         if (isMounted) {
-          render(null, app._container!)
+          render(null, app._container)
         } else if (__DEV__) {
           warn(`Cannot unmount an app that is not mounted.`)
         }
@@ -218,7 +241,7 @@ export function createAppAPI<HostNode, HostElement>(
       provide(key, value) {
         if (__DEV__ && key in context.provides) {
           warn(
-            `App already provides property with key "${key}". ` +
+            `App already provides property with key "${String(key)}". ` +
               `It will be overwritten with the new value.`
           )
         }

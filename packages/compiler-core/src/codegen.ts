@@ -15,7 +15,6 @@ import {
   CompoundExpressionNode,
   SimpleExpressionNode,
   FunctionExpression,
-  SequenceExpression,
   ConditionalExpression,
   CacheExpression,
   locStub,
@@ -23,14 +22,15 @@ import {
   TemplateLiteral,
   IfStatement,
   AssignmentExpression,
-  ReturnStatement
+  ReturnStatement,
+  VNodeCall,
+  SequenceExpression
 } from './ast'
 import { SourceMapGenerator, RawSourceMap } from 'source-map'
 import {
   advancePositionWithMutation,
   assert,
   isSimpleIdentifier,
-  loadDep,
   toValidAssetId
 } from './utils'
 import { isString, isArray, isSymbol } from '@vue/shared'
@@ -45,9 +45,16 @@ import {
   CREATE_TEXT,
   PUSH_SCOPE_ID,
   POP_SCOPE_ID,
-  WITH_SCOPE_ID
+  WITH_SCOPE_ID,
+  WITH_DIRECTIVES,
+  CREATE_BLOCK,
+  OPEN_BLOCK,
+  CREATE_STATIC,
+  WITH_CTX
 } from './runtimeHelpers'
 import { ImportItem } from './transform'
+
+const PURE_ANNOTATION = `/*#__PURE__*/`
 
 type CodegenNode = TemplateChildNode | JSChildNode | SSRCodegenNode
 
@@ -64,6 +71,7 @@ export interface CodegenContext extends Required<CodegenOptions> {
   column: number
   offset: number
   indentLevel: number
+  pure: boolean
   map?: SourceMapGenerator
   helper(key: symbol): string
   push(code: string, node?: CodegenNode): void
@@ -102,6 +110,7 @@ function createCodegenContext(
     line: 1,
     offset: 0,
     indentLevel: 0,
+    pure: false,
     map: undefined,
     helper(key) {
       return `_${helperNameMap[key]}`
@@ -161,7 +170,7 @@ function createCodegenContext(
 
   if (!__BROWSER__ && sourceMap) {
     // lazy require source-map implementation, only in non-browser builds
-    context.map = new (loadDep('source-map')).SourceMapGenerator()
+    context.map = new SourceMapGenerator()
     context.map!.setSourceContent(filename, context.source)
   }
 
@@ -196,7 +205,7 @@ export function generate(
 
   // enter render function
   if (genScopeId && !ssr) {
-    push(`const render = _withId(`)
+    push(`const render = ${PURE_ANNOTATION}_withId(`)
   }
   if (!ssr) {
     push(`function render(_ctx, _cache) {`)
@@ -206,7 +215,7 @@ export function generate(
   indent()
 
   if (useWithBlock) {
-    push(`with (this) {`)
+    push(`with (_ctx) {`)
     indent()
     // function mode const declarations should be inside with block
     // also they should be renamed to avoid collision with user properties
@@ -306,7 +315,12 @@ function genFunctionPreamble(ast: RootNode, context: CodegenContext) {
       // has check cost, but hoists are lifted out of the function - we need
       // to provide the helper here.
       if (ast.hoists.length) {
-        const staticHelpers = [CREATE_VNODE, CREATE_COMMENT, CREATE_TEXT]
+        const staticHelpers = [
+          CREATE_VNODE,
+          CREATE_COMMENT,
+          CREATE_TEXT,
+          CREATE_STATIC
+        ]
           .filter(helper => ast.helpers.includes(helper))
           .map(aliasHelper)
           .join(', ')
@@ -390,7 +404,9 @@ function genModulePreamble(
   }
 
   if (genScopeId) {
-    push(`const _withId = ${helper(WITH_SCOPE_ID)}("${scopeId}")`)
+    push(
+      `const _withId = ${PURE_ANNOTATION}${helper(WITH_SCOPE_ID)}("${scopeId}")`
+    )
     newline()
   }
 
@@ -422,6 +438,7 @@ function genHoists(hoists: JSChildNode[], context: CodegenContext) {
   if (!hoists.length) {
     return
   }
+  context.pure = true
   const { push, newline, helper, scopeId, mode } = context
   const genScopeId = !__BROWSER__ && scopeId != null && mode !== 'function'
   newline()
@@ -443,6 +460,7 @@ function genHoists(hoists: JSChildNode[], context: CodegenContext) {
     push(`${helper(POP_SCOPE_ID)}()`)
     newline()
   }
+  context.pure = false
 }
 
 function genImports(importsOptions: ImportItem[], context: CodegenContext) {
@@ -547,6 +565,10 @@ function genNode(node: CodegenNode | symbol | string, context: CodegenContext) {
     case NodeTypes.COMMENT:
       genComment(node, context)
       break
+    case NodeTypes.VNODE_CALL:
+      genVNodeCall(node, context)
+      break
+
     case NodeTypes.JS_CALL_EXPRESSION:
       genCallExpression(node, context)
       break
@@ -558,9 +580,6 @@ function genNode(node: CodegenNode | symbol | string, context: CodegenContext) {
       break
     case NodeTypes.JS_FUNCTION_EXPRESSION:
       genFunctionExpression(node, context)
-      break
-    case NodeTypes.JS_SEQUENCE_EXPRESSION:
-      genSequenceExpression(node, context)
       break
     case NodeTypes.JS_CONDITIONAL_EXPRESSION:
       genConditionalExpression(node, context)
@@ -582,11 +601,17 @@ function genNode(node: CodegenNode | symbol | string, context: CodegenContext) {
     case NodeTypes.JS_ASSIGNMENT_EXPRESSION:
       !__BROWSER__ && genAssignmentExpression(node, context)
       break
+    case NodeTypes.JS_SEQUENCE_EXPRESSION:
+      !__BROWSER__ && genSequenceExpression(node, context)
+      break
     case NodeTypes.JS_RETURN_STATEMENT:
       !__BROWSER__ && genReturnStatement(node, context)
       break
 
     /* istanbul ignore next */
+    case NodeTypes.IF_BRANCH:
+      // noop
+      break
     default:
       if (__DEV__) {
         assert(false, `unhandled codegen node type: ${(node as any).type}`)
@@ -610,7 +635,8 @@ function genExpression(node: SimpleExpressionNode, context: CodegenContext) {
 }
 
 function genInterpolation(node: InterpolationNode, context: CodegenContext) {
-  const { push, helper } = context
+  const { push, helper, pure } = context
+  if (pure) push(PURE_ANNOTATION)
   push(`${helper(TO_DISPLAY_STRING)}(`)
   genNode(node.content, context)
   push(`)`)
@@ -652,19 +678,69 @@ function genExpressionAsPropertyKey(
 
 function genComment(node: CommentNode, context: CodegenContext) {
   if (__DEV__) {
-    const { push, helper } = context
+    const { push, helper, pure } = context
+    if (pure) {
+      push(PURE_ANNOTATION)
+    }
     push(`${helper(CREATE_COMMENT)}(${JSON.stringify(node.content)})`, node)
   }
 }
 
+function genVNodeCall(node: VNodeCall, context: CodegenContext) {
+  const { push, helper, pure } = context
+  const {
+    tag,
+    props,
+    children,
+    patchFlag,
+    dynamicProps,
+    directives,
+    isBlock,
+    isForBlock
+  } = node
+  if (directives) {
+    push(helper(WITH_DIRECTIVES) + `(`)
+  }
+  if (isBlock) {
+    push(`(${helper(OPEN_BLOCK)}(${isForBlock ? `true` : ``}), `)
+  }
+  if (pure) {
+    push(PURE_ANNOTATION)
+  }
+  push(helper(isBlock ? CREATE_BLOCK : CREATE_VNODE) + `(`, node)
+  genNodeList(
+    genNullableArgs([tag, props, children, patchFlag, dynamicProps]),
+    context
+  )
+  push(`)`)
+  if (isBlock) {
+    push(`)`)
+  }
+  if (directives) {
+    push(`, `)
+    genNode(directives, context)
+    push(`)`)
+  }
+}
+
+function genNullableArgs(args: any[]): CallExpression['arguments'] {
+  let i = args.length
+  while (i--) {
+    if (args[i] != null) break
+  }
+  return args.slice(0, i + 1).map(arg => arg || `null`)
+}
+
 // JavaScript
 function genCallExpression(node: CallExpression, context: CodegenContext) {
-  const callee = isString(node.callee)
-    ? node.callee
-    : context.helper(node.callee)
-  context.push(callee + `(`, node)
+  const { push, helper, pure } = context
+  const callee = isString(node.callee) ? node.callee : helper(node.callee)
+  if (pure) {
+    push(PURE_ANNOTATION)
+  }
+  push(callee + `(`, node)
   genNodeList(node.arguments, context)
-  context.push(`)`)
+  push(`)`)
 }
 
 function genObjectExpression(node: ObjectExpression, context: CodegenContext) {
@@ -713,6 +789,8 @@ function genFunctionExpression(
 
   if (genScopeId) {
     push(`_withId(`)
+  } else if (isSlot) {
+    push(`_${helperNameMap[WITH_CTX]}(`)
   }
   push(`(`, node)
   if (isArray(params)) {
@@ -741,7 +819,7 @@ function genFunctionExpression(
     deindent()
     push(`}`)
   }
-  if (genScopeId) {
+  if (genScopeId || isSlot) {
     push(`)`)
   }
 }
@@ -780,15 +858,6 @@ function genConditionalExpression(
     context.indentLevel--
   }
   needNewline && deindent(true /* without newline */)
-}
-
-function genSequenceExpression(
-  node: SequenceExpression,
-  context: CodegenContext
-) {
-  context.push(`(`)
-  genNodeList(node.expressions, context)
-  context.push(`)`)
 }
 
 function genCacheExpression(node: CacheExpression, context: CodegenContext) {
@@ -863,6 +932,15 @@ function genAssignmentExpression(
   genNode(node.left, context)
   context.push(` = `)
   genNode(node.right, context)
+}
+
+function genSequenceExpression(
+  node: SequenceExpression,
+  context: CodegenContext
+) {
+  context.push(`(`)
+  genNodeList(node.expressions, context)
+  context.push(`)`)
 }
 
 function genReturnStatement(

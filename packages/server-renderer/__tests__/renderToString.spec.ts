@@ -4,7 +4,11 @@ import {
   createCommentVNode,
   withScopeId,
   resolveComponent,
-  ComponentOptions
+  ComponentOptions,
+  ref,
+  defineComponent,
+  createTextVNode,
+  createStaticVNode
 } from 'vue'
 import { escapeHtml, mockWarn } from '@vue/shared'
 import { renderToString, renderComponent } from '../src/renderToString'
@@ -43,6 +47,32 @@ describe('ssr: renderToString', () => {
       ).toBe(`<div>hello</div>`)
     })
 
+    test('option components returning render from setup', async () => {
+      expect(
+        await renderToString(
+          createApp({
+            setup() {
+              const msg = ref('hello')
+              return () => h('div', msg.value)
+            }
+          })
+        )
+      ).toBe(`<div>hello</div>`)
+    })
+
+    test('setup components returning render from setup', async () => {
+      expect(
+        await renderToString(
+          createApp(
+            defineComponent((props: {}) => {
+              const msg = ref('hello')
+              return () => h('div', msg.value)
+            })
+          )
+        )
+      ).toBe(`<div>hello</div>`)
+    })
+
     test('optimized components', async () => {
       expect(
         await renderToString(
@@ -76,7 +106,7 @@ describe('ssr: renderToString', () => {
         await renderToString(createApp({ template: `<` }))
 
         expect(
-          '[Vue warn]: Template compilation error: Unexpected EOF in tag.\n' +
+          'Template compilation error: Unexpected EOF in tag.\n' +
             '1  |  <\n' +
             '   |   ^'
         ).toHaveBeenWarned()
@@ -218,7 +248,7 @@ describe('ssr: renderToString', () => {
                       push(`<span>${msg}</span>`)
                     },
                     // important to avoid slots being normalized
-                    _compiled: true as any
+                    _: 1 as any
                   },
                   parent
                 )
@@ -229,7 +259,7 @@ describe('ssr: renderToString', () => {
         )
       ).toBe(
         `<div>parent<div class="child">` +
-          `<!----><span>from slot</span><!---->` +
+          `<!--[--><span>from slot</span><!--]-->` +
           `</div></div>`
       )
 
@@ -244,7 +274,9 @@ describe('ssr: renderToString', () => {
             }
           })
         )
-      ).toBe(`<div>parent<div class="child"><!---->fallback<!----></div></div>`)
+      ).toBe(
+        `<div>parent<div class="child"><!--[-->fallback<!--]--></div></div>`
+      )
     })
 
     test('nested components with vnode slots', async () => {
@@ -288,7 +320,7 @@ describe('ssr: renderToString', () => {
         )
       ).toBe(
         `<div>parent<div class="child">` +
-          `<!----><span>from slot</span><!---->` +
+          `<!--[--><span>from slot</span><!--]-->` +
           `</div></div>`
       )
     })
@@ -300,13 +332,13 @@ describe('ssr: renderToString', () => {
       }
 
       const app = createApp({
+        components: { Child },
         template: `<div>parent<Child v-slot="{ msg }"><span>{{ msg }}</span></Child></div>`
       })
-      app.component('Child', Child)
 
       expect(await renderToString(app)).toBe(
         `<div>parent<div class="child">` +
-          `<!----><span>from slot</span><!---->` +
+          `<!--[--><span>from slot</span><!--]-->` +
           `</div></div>`
       )
     })
@@ -332,6 +364,7 @@ describe('ssr: renderToString', () => {
 
       expect(await renderToString(app)).toBe(
         `<div>parent<div class="child">` +
+          // no comment anchors because slot is used directly as element children
           `<span>from slot</span>` +
           `</div></div>`
       )
@@ -339,7 +372,7 @@ describe('ssr: renderToString', () => {
 
     test('async components', async () => {
       const Child = {
-        // should wait for resovled render context from setup()
+        // should wait for resolved render context from setup()
         async setup() {
           return {
             msg: 'hello'
@@ -429,7 +462,7 @@ describe('ssr: renderToString', () => {
           ])
         )
       ).toBe(
-        `<div>foo<span>bar</span><!----><span>baz</span><!----><!--qux--></div>`
+        `<div>foo<span>bar</span><!--[--><span>baz</span><!--]--><!--qux--></div>`
       )
     })
 
@@ -480,6 +513,33 @@ describe('ssr: renderToString', () => {
     })
   })
 
+  describe('raw vnode types', () => {
+    test('Text', async () => {
+      expect(await renderToString(createTextVNode('hello <div>'))).toBe(
+        `hello &lt;div&gt;`
+      )
+    })
+
+    test('Comment', async () => {
+      // https://www.w3.org/TR/html52/syntax.html#comments
+      expect(
+        await renderToString(
+          h('div', [
+            createCommentVNode('>foo'),
+            createCommentVNode('->foo'),
+            createCommentVNode('<!--foo-->'),
+            createCommentVNode('--!>foo<!-')
+          ])
+        )
+      ).toBe(`<div><!--foo--><!--foo--><!--foo--><!--foo--></div>`)
+    })
+
+    test('Static', async () => {
+      const content = `<div id="ok">hello<span>world</span></div>`
+      expect(await renderToString(createStaticVNode(content))).toBe(content)
+    })
+  })
+
   describe('scopeId', () => {
     // note: here we are only testing scopeId handling for vdom serialization.
     // compiled srr render functions will include scopeId directly in strings.
@@ -514,7 +574,7 @@ describe('ssr: renderToString', () => {
       }
 
       expect(await renderToString(h(Parent))).toBe(
-        `<div data-v-child><span data-v-test data-v-child-s>slot</span></div>`
+        `<div data-v-test data-v-child><span data-v-test data-v-child-s>slot</span></div>`
       )
     })
   })

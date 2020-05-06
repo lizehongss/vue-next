@@ -9,8 +9,7 @@ import {
   NodeTransform,
   DirectiveTransform
 } from '@vue/compiler-core'
-import { parserOptionsMinimal } from './parserOptionsMinimal'
-import { parserOptionsStandard } from './parserOptionsStandard'
+import { parserOptions } from './parserOptions'
 import { transformStyle } from './transforms/transformStyle'
 import { transformVHtml } from './transforms/vHtml'
 import { transformVText } from './transforms/vText'
@@ -18,10 +17,9 @@ import { transformModel } from './transforms/vModel'
 import { transformOn } from './transforms/vOn'
 import { transformShow } from './transforms/vShow'
 import { warnTransitionChildren } from './transforms/warnTransitionChildren'
+import { stringifyStatic } from './transforms/stringifyStatic'
 
-export const parserOptions = __BROWSER__
-  ? parserOptionsMinimal
-  : parserOptionsStandard
+export { parserOptions }
 
 export const DOMNodeTransforms: NodeTransform[] = [
   transformStyle,
@@ -41,17 +39,16 @@ export function compile(
   template: string,
   options: CompilerOptions = {}
 ): CodegenResult {
-  const result = baseCompile(template, {
+  return baseCompile(template, {
     ...parserOptions,
     ...options,
     nodeTransforms: [...DOMNodeTransforms, ...(options.nodeTransforms || [])],
     directiveTransforms: {
       ...DOMDirectiveTransforms,
       ...(options.directiveTransforms || {})
-    }
+    },
+    transformHoist: __BROWSER__ ? null : stringifyStatic
   })
-  // debugger
-  return result
 }
 
 export function parse(template: string, options: ParserOptions = {}): RootNode {

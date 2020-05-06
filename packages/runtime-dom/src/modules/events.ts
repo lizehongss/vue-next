@@ -1,4 +1,4 @@
-import { isArray, EMPTY_OBJ } from '@vue/shared'
+import { EMPTY_OBJ, isArray } from '@vue/shared'
 import {
   ComponentInternalInstance,
   callWithAsyncErrorHandling
@@ -17,7 +17,6 @@ type EventValue = (Function | Function[]) & {
 type EventValueWithOptions = {
   handler: EventValue
   options: AddEventListenerOptions
-  persistent?: boolean
   invoker?: Invoker | null
 }
 
@@ -67,20 +66,19 @@ export function removeEventListener(
 
 export function patchEvent(
   el: Element,
-  name: string,
+  rawName: string,
   prevValue: EventValueWithOptions | EventValue | null,
   nextValue: EventValueWithOptions | EventValue | null,
   instance: ComponentInternalInstance | null = null
 ) {
+  const name = rawName.slice(2).toLowerCase()
   const prevOptions = prevValue && 'options' in prevValue && prevValue.options
   const nextOptions = nextValue && 'options' in nextValue && nextValue.options
   const invoker = prevValue && prevValue.invoker
   const value =
     nextValue && 'handler' in nextValue ? nextValue.handler : nextValue
-  const persistent =
-    nextValue && 'persistent' in nextValue && nextValue.persistent
 
-  if (!persistent && (prevOptions || nextOptions)) {
+  if (prevOptions || nextOptions) {
     const prev = prevOptions || EMPTY_OBJ
     const next = nextOptions || EMPTY_OBJ
     if (
@@ -120,7 +118,7 @@ export function patchEvent(
 }
 
 function createInvoker(
-  initialValue: any,
+  initialValue: EventValue,
   instance: ComponentInternalInstance | null
 ) {
   const invoker: Invoker = (e: Event) => {
@@ -131,29 +129,32 @@ function createInvoker(
     // and the handler would only fire if the event passed to it was fired
     // AFTER it was attached.
     if (e.timeStamp >= invoker.lastUpdated - 1) {
-      const args = [e]
-      const value = invoker.value
-      if (isArray(value)) {
-        for (let i = 0; i < value.length; i++) {
-          callWithAsyncErrorHandling(
-            value[i],
-            instance,
-            ErrorCodes.NATIVE_EVENT_HANDLER,
-            args
-          )
-        }
-      } else {
-        callWithAsyncErrorHandling(
-          value,
-          instance,
-          ErrorCodes.NATIVE_EVENT_HANDLER,
-          args
-        )
-      }
+      callWithAsyncErrorHandling(
+        patchStopImmediatePropagation(e, invoker.value),
+        instance,
+        ErrorCodes.NATIVE_EVENT_HANDLER,
+        [e]
+      )
     }
   }
   invoker.value = initialValue
   initialValue.invoker = invoker
   invoker.lastUpdated = getNow()
   return invoker
+}
+
+function patchStopImmediatePropagation(
+  e: Event,
+  value: EventValue
+): EventValue {
+  if (isArray(value)) {
+    const originalStop = e.stopImmediatePropagation
+    e.stopImmediatePropagation = () => {
+      originalStop.call(e)
+      ;(e as any)._stopped = true
+    }
+    return value.map(fn => (e: Event) => !(e as any)._stopped && fn(e))
+  } else {
+    return value
+  }
 }

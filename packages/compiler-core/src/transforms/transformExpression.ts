@@ -16,16 +16,17 @@ import {
   CompoundExpressionNode,
   createCompoundExpression
 } from '../ast'
-import { Node, Function, Identifier, Property } from 'estree'
 import {
   advancePositionWithClone,
   isSimpleIdentifier,
   parseJS,
   walkJS
 } from '../utils'
-import { globalsWhitelist } from '@vue/shared'
+import { isGloballyWhitelisted, makeMap } from '@vue/shared'
+import { createCompilerError, ErrorCodes } from '../errors'
+import { Node, Function, Identifier, ObjectProperty } from '@babel/types'
 
-const literalsWhitelist = new Set([`true`, `false`, `null`, `this`])
+const isLiteralWhitelisted = /*#__PURE__*/ makeMap('true,false,null,this')
 
 export const transformExpression: NodeTransform = (node, context) => {
   if (node.type === NodeTypes.INTERPOLATION) {
@@ -39,11 +40,15 @@ export const transformExpression: NodeTransform = (node, context) => {
       const dir = node.props[i]
       // do not process for v-on & v-for since they are special handled
       if (dir.type === NodeTypes.DIRECTIVE && dir.name !== 'for') {
-        const exp = dir.exp as SimpleExpressionNode | undefined
-        const arg = dir.arg as SimpleExpressionNode | undefined
+        const exp = dir.exp
+        const arg = dir.arg
         // do not process exp if this is v-on:arg - we need special handling
         // for wrapping inline statements.
-        if (exp && !(dir.name === 'on' && arg)) {
+        if (
+          exp &&
+          exp.type === NodeTypes.SIMPLE_EXPRESSION &&
+          !(dir.name === 'on' && arg)
+        ) {
           dir.exp = processExpression(
             exp,
             context,
@@ -51,7 +56,7 @@ export const transformExpression: NodeTransform = (node, context) => {
             dir.name === 'slot'
           )
         }
-        if (arg && !arg.isStatic) {
+        if (arg && arg.type === NodeTypes.SIMPLE_EXPRESSION && !arg.isStatic) {
           dir.arg = processExpression(arg, context)
         }
       }
@@ -61,6 +66,7 @@ export const transformExpression: NodeTransform = (node, context) => {
 
 interface PrefixMeta {
   prefix?: string
+  isConstant: boolean
   start: number
   end: number
   scopeIds?: Set<string>
@@ -74,46 +80,78 @@ export function processExpression(
   context: TransformContext,
   // some expressions like v-slot props & v-for aliases should be parsed as
   // function params
-  asParams: boolean = false
+  asParams = false,
+  // v-on handler values may contain multiple statements
+  asRawStatements = false
 ): ExpressionNode {
-  if (!context.prefixIdentifiers) {
+  if (!context.prefixIdentifiers || !node.content.trim()) {
     return node
   }
 
   // fast path if expression is a simple identifier.
   const rawExp = node.content
+  // bail on parens to prevent any possible function invocations.
+  const bailConstant = rawExp.indexOf(`(`) > -1
   if (isSimpleIdentifier(rawExp)) {
     if (
       !asParams &&
       !context.identifiers[rawExp] &&
-      !globalsWhitelist.has(rawExp) &&
-      !literalsWhitelist.has(rawExp)
+      !isGloballyWhitelisted(rawExp) &&
+      !isLiteralWhitelisted(rawExp)
     ) {
       node.content = `_ctx.${rawExp}`
+    } else if (!context.identifiers[rawExp] && !bailConstant) {
+      // mark node constant for hoisting unless it's referring a scope variable
+      node.isConstant = true
     }
     return node
   }
 
   let ast: any
-  // if the expression is supposed to be used in a function params position
-  // we need to parse it differently.
-  const source = `(${rawExp})${asParams ? `=>{}` : ``}`
+  // exp needs to be parsed differently:
+  // 1. Multiple inline statements (v-on, with presence of `;`): parse as raw
+  //    exp, but make sure to pad with spaces for consistent ranges
+  // 2. Expressions: wrap with parens (for e.g. object expressions)
+  // 3. Function arguments (v-for, v-slot): place in a function argument position
+  const source = asRawStatements
+    ? ` ${rawExp} `
+    : `(${rawExp})${asParams ? `=>{}` : ``}`
   try {
-    ast = parseJS(source, { ranges: true })
+    ast = parseJS(source, {
+      plugins: [
+        ...context.expressionPlugins,
+        // by default we enable proposals slated for ES2020.
+        // full list at https://babeljs.io/docs/en/next/babel-parser#plugins
+        // this will need to be updated as the spec moves forward.
+        'bigInt',
+        'optionalChaining',
+        'nullishCoalescingOperator'
+      ]
+    }).program
   } catch (e) {
-    context.onError(e)
+    context.onError(
+      createCompilerError(
+        ErrorCodes.X_INVALID_EXPRESSION,
+        node.loc,
+        undefined,
+        e.message
+      )
+    )
     return node
   }
 
   const ids: (Identifier & PrefixMeta)[] = []
   const knownIds = Object.create(context.identifiers)
+  const isDuplicate = (node: Node & PrefixMeta): boolean =>
+    ids.some(id => id.start === node.start)
 
   // walk the AST and look for identifiers that need to be prefixed with `_ctx.`.
   walkJS(ast, {
     enter(node: Node & PrefixMeta, parent) {
       if (node.type === 'Identifier') {
-        if (!ids.includes(node)) {
-          if (!knownIds[node.name] && shouldPrefix(node, parent)) {
+        if (!isDuplicate(node)) {
+          const needPrefix = shouldPrefix(node, parent)
+          if (!knownIds[node.name] && needPrefix) {
             if (isPropertyShorthand(node, parent)) {
               // property shorthand like { foo }, we need to add the key since we
               // rewrite the value
@@ -122,6 +160,11 @@ export function processExpression(
             node.name = `_ctx.${node.name}`
             ids.push(node)
           } else if (!isStaticPropertyKey(node, parent)) {
+            // The identifier is considered constant unless it's pointing to a
+            // scope variable (a v-for alias, or a v-slot prop)
+            if (!(needPrefix && knownIds[node.name]) && !bailConstant) {
+              node.isConstant = true
+            }
             // also generate sub-expressions for other identifiers for better
             // source map support. (except for property keys which are static)
             ids.push(node)
@@ -190,11 +233,16 @@ export function processExpression(
     }
     const source = rawExp.slice(start, end)
     children.push(
-      createSimpleExpression(id.name, false, {
-        source,
-        start: advancePositionWithClone(node.loc.start, source, start),
-        end: advancePositionWithClone(node.loc.start, source, end)
-      })
+      createSimpleExpression(
+        id.name,
+        false,
+        {
+          source,
+          start: advancePositionWithClone(node.loc.start, source, start),
+          end: advancePositionWithClone(node.loc.start, source, end)
+        },
+        id.isConstant /* isConstant */
+      )
     )
     if (i === ids.length - 1 && end < rawExp.length) {
       children.push(rawExp.slice(end))
@@ -206,6 +254,7 @@ export function processExpression(
     ret = createCompoundExpression(children, node.loc)
   } else {
     ret = node
+    ret.isConstant = !bailConstant
   }
   ret.identifiers = Object.keys(knownIds)
   return ret
@@ -214,17 +263,21 @@ export function processExpression(
 const isFunction = (node: Node): node is Function =>
   /Function(Expression|Declaration)$/.test(node.type)
 
-const isPropertyKey = (node: Node, parent: Node) =>
-  parent &&
-  parent.type === 'Property' &&
-  parent.key === node &&
-  !parent.computed
+const isStaticProperty = (node: Node): node is ObjectProperty =>
+  node && node.type === 'ObjectProperty' && !node.computed
 
-const isPropertyShorthand = (node: Node, parent: Node) =>
-  isPropertyKey(node, parent) && (parent as Property).value === node
+const isPropertyShorthand = (node: Node, parent: Node) => {
+  return (
+    isStaticProperty(parent) &&
+    parent.value === node &&
+    parent.key.type === 'Identifier' &&
+    parent.key.name === (node as Identifier).name &&
+    parent.key.start === node.start
+  )
+}
 
 const isStaticPropertyKey = (node: Node, parent: Node) =>
-  isPropertyKey(node, parent) && (parent as Property).value !== node
+  isStaticProperty(parent) && parent.key === node
 
 function shouldPrefix(identifier: Identifier, parent: Node) {
   if (
@@ -239,14 +292,15 @@ function shouldPrefix(identifier: Identifier, parent: Node) {
     !isStaticPropertyKey(identifier, parent) &&
     // not a property of a MemberExpression
     !(
-      parent.type === 'MemberExpression' &&
+      (parent.type === 'MemberExpression' ||
+        parent.type === 'OptionalMemberExpression') &&
       parent.property === identifier &&
       !parent.computed
     ) &&
     // not in an Array destructure pattern
     !(parent.type === 'ArrayPattern') &&
     // skip whitelisted globals
-    !globalsWhitelist.has(identifier.name) &&
+    !isGloballyWhitelisted(identifier.name) &&
     // special case for webpack compilation
     identifier.name !== `require` &&
     // is a special keyword but parsed as identifier

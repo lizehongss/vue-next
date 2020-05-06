@@ -1,9 +1,7 @@
-import { reactive, readonly, toRaw } from './reactive'
-// 检查事件
-import { OperationTypes } from './operations'
-import { track, trigger } from './effect'
-import { LOCKED } from './lock'
-import { isObject, hasOwn, isSymbol } from '@vue/shared'
+import { reactive, readonly, toRaw, ReactiveFlags } from './reactive'
+import { TrackOpTypes, TriggerOpTypes } from './operations'
+import { track, trigger, ITERATE_KEY } from './effect'
+import { isObject, hasOwn, isSymbol, hasChanged, isArray } from '@vue/shared'
 import { isRef } from './ref'
 
 const builtInSymbols = new Set(
@@ -12,21 +10,65 @@ const builtInSymbols = new Set(
     .filter(isSymbol)
 )
 
-function createGetter(isReadonly: boolean) {
-  //Reflect返回trap行为
-  return function get(target: any, key: string | symbol, receiver: any) {
+const get = /*#__PURE__*/ createGetter()
+const shallowGet = /*#__PURE__*/ createGetter(false, true)
+const readonlyGet = /*#__PURE__*/ createGetter(true)
+const shallowReadonlyGet = /*#__PURE__*/ createGetter(true, true)
+
+const arrayInstrumentations: Record<string, Function> = {}
+;['includes', 'indexOf', 'lastIndexOf'].forEach(key => {
+  arrayInstrumentations[key] = function(...args: any[]): any {
+    const arr = toRaw(this) as any
+    for (let i = 0, l = (this as any).length; i < l; i++) {
+      track(arr, TrackOpTypes.GET, i + '')
+    }
+    // we run the method using the original args first (which may be reactive)
+    const res = arr[key](...args)
+    if (res === -1 || res === false) {
+      // if that didn't work, run it again using raw values.
+      return arr[key](...args.map(toRaw))
+    } else {
+      return res
+    }
+  }
+})
+
+function createGetter(isReadonly = false, shallow = false) {
+  return function get(target: object, key: string | symbol, receiver: object) {
+    if (key === ReactiveFlags.isReactive) {
+      return !isReadonly
+    } else if (key === ReactiveFlags.isReadonly) {
+      return isReadonly
+    } else if (key === ReactiveFlags.raw || key === '__proto__') {
+      return target
+    }
+
+    const targetIsArray = isArray(target)
+    if (targetIsArray && hasOwn(arrayInstrumentations, key)) {
+      return Reflect.get(arrayInstrumentations, key, receiver)
+    }
     const res = Reflect.get(target, key, receiver)
+
     if (isSymbol(key) && builtInSymbols.has(key)) {
       return res
     }
-    if (isRef(res)) {
-      return res.value
+
+    if (shallow) {
+      !isReadonly && track(target, TrackOpTypes.GET, key)
+      return res
     }
-    //用于将数据添加到监听函数，使数据改变时能够触发监听函数
-    //监听函数收集依赖方法
-    track(target, OperationTypes.GET, key)
-    //这里判断了 Reflect 返回的数据是否还是对象，
-    //如果是对象，则再走一次 proxy ，从而获得了对对象内部的侦测
+
+    if (isRef(res)) {
+      if (targetIsArray) {
+        !isReadonly && track(target, TrackOpTypes.GET, key)
+        return res
+      } else {
+        // ref unwrapping, only for Objects, not for Arrays.
+        return res.value
+      }
+    }
+
+    !isReadonly && track(target, TrackOpTypes.GET, key)
     return isObject(res)
       ? isReadonly
         ? // need to lazy access readonly and reactive here to avoid
@@ -37,108 +79,104 @@ function createGetter(isReadonly: boolean) {
   }
 }
 
-function set(
-  target: any,
-  key: string | symbol,
-  value: any,
-  receiver: any
-): boolean {
-  value = toRaw(value)
-  const hadKey = hasOwn(target, key)
-  const oldValue = target[key]
-  if (isRef(oldValue) && !isRef(value)) {
-    oldValue.value = value
-    return true
-  }
-  const result = Reflect.set(target, key, value, receiver)
-  // don't trigger if target is something up in the prototype chain of original
-  if (target === toRaw(receiver)) {
-    /* istanbul ignore else */
-    if (__DEV__) {
-      const extraInfo = { oldValue, newValue: value }
-      if (!hadKey) {
-        trigger(target, OperationTypes.ADD, key, extraInfo)
-      } else if (value !== oldValue) {
-        trigger(target, OperationTypes.SET, key, extraInfo)
+const set = /*#__PURE__*/ createSetter()
+const shallowSet = /*#__PURE__*/ createSetter(true)
+
+function createSetter(shallow = false) {
+  return function set(
+    target: object,
+    key: string | symbol,
+    value: unknown,
+    receiver: object
+  ): boolean {
+    const oldValue = (target as any)[key]
+    if (!shallow) {
+      value = toRaw(value)
+      if (!isArray(target) && isRef(oldValue) && !isRef(value)) {
+        oldValue.value = value
+        return true
       }
     } else {
+      // in shallow mode, objects are set as-is regardless of reactive or not
+    }
+
+    const hadKey = hasOwn(target, key)
+    const result = Reflect.set(target, key, value, receiver)
+    // don't trigger if target is something up in the prototype chain of original
+    if (target === toRaw(receiver)) {
       if (!hadKey) {
-        trigger(target, OperationTypes.ADD, key)
-      } else if (value !== oldValue) {
-        trigger(target, OperationTypes.SET, key)
+        trigger(target, TriggerOpTypes.ADD, key, value)
+      } else if (hasChanged(value, oldValue)) {
+        trigger(target, TriggerOpTypes.SET, key, value, oldValue)
       }
     }
+    return result
   }
-  return result
 }
 
-function deleteProperty(target: any, key: string | symbol): boolean {
+function deleteProperty(target: object, key: string | symbol): boolean {
   const hadKey = hasOwn(target, key)
-  const oldValue = target[key]
+  const oldValue = (target as any)[key]
   const result = Reflect.deleteProperty(target, key)
   if (result && hadKey) {
-    /* istanbul ignore else */
-    if (__DEV__) {
-      trigger(target, OperationTypes.DELETE, key, { oldValue })
-    } else {
-      trigger(target, OperationTypes.DELETE, key)
-    }
+    trigger(target, TriggerOpTypes.DELETE, key, undefined, oldValue)
   }
   return result
 }
 
-function has(target: any, key: string | symbol): boolean {
+function has(target: object, key: string | symbol): boolean {
   const result = Reflect.has(target, key)
-  track(target, OperationTypes.HAS, key)
+  track(target, TrackOpTypes.HAS, key)
   return result
 }
 
-function ownKeys(target: any): (string | number | symbol)[] {
-  track(target, OperationTypes.ITERATE)
+function ownKeys(target: object): (string | number | symbol)[] {
+  track(target, TrackOpTypes.ITERATE, ITERATE_KEY)
   return Reflect.ownKeys(target)
 }
-// ProxyHandler暂未知，可能为typeScript内部实现类型
-export const mutableHandlers: ProxyHandler<any> = {
-  get: createGetter(false),
+
+export const mutableHandlers: ProxyHandler<object> = {
+  get,
   set,
   deleteProperty,
   has,
   ownKeys
 }
 
-export const readonlyHandlers: ProxyHandler<any> = {
-  get: createGetter(true),
-
-  set(target: any, key: string | symbol, value: any, receiver: any): boolean {
-    if (LOCKED) {
-      if (__DEV__) {
-        console.warn(
-          `Set operation on key "${String(key)}" failed: target is readonly.`,
-          target
-        )
-      }
-      return true
-    } else {
-      return set(target, key, value, receiver)
-    }
-  },
-
-  deleteProperty(target: any, key: string | symbol): boolean {
-    if (LOCKED) {
-      if (__DEV__) {
-        console.warn(
-          `Delete operation on key "${String(
-            key
-          )}" failed: target is readonly.`,
-          target
-        )
-      }
-      return true
-    } else {
-      return deleteProperty(target, key)
-    }
-  },
-
+export const readonlyHandlers: ProxyHandler<object> = {
+  get: readonlyGet,
   has,
-  ownKeys
+  ownKeys,
+  set(target, key) {
+    if (__DEV__) {
+      console.warn(
+        `Set operation on key "${String(key)}" failed: target is readonly.`,
+        target
+      )
+    }
+    return true
+  },
+  deleteProperty(target, key) {
+    if (__DEV__) {
+      console.warn(
+        `Delete operation on key "${String(key)}" failed: target is readonly.`,
+        target
+      )
+    }
+    return true
+  }
+}
+
+export const shallowReactiveHandlers: ProxyHandler<object> = {
+  ...mutableHandlers,
+  get: shallowGet,
+  set: shallowSet
+}
+
+// Props handlers are special in the sense that it should not unwrap top-level
+// refs (in order to allow refs to be explicitly passed down), but should
+// retain the reactivity of the normal readonly object.
+export const shallowReadonlyHandlers: ProxyHandler<object> = {
+  ...readonlyHandlers,
+  get: shallowReadonlyGet
 }

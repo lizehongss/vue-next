@@ -3,9 +3,11 @@ import {
   effect,
   stop,
   toRaw,
-  OperationTypes,
+  TrackOpTypes,
+  TriggerOpTypes,
   DebuggerEvent,
-  markNonReactive
+  markRaw,
+  ref
 } from '../src/index'
 import { ITERATE_KEY } from '../src/effect'
 
@@ -249,6 +251,36 @@ describe('reactivity/effect', () => {
     expect(dummy).toBe(newFunc)
   })
 
+  it('should observe chained getters relying on this', () => {
+    const obj = reactive({
+      a: 1,
+      get b() {
+        return this.a
+      }
+    })
+
+    let dummy
+    effect(() => (dummy = obj.b))
+    expect(dummy).toBe(1)
+    obj.a++
+    expect(dummy).toBe(2)
+  })
+
+  it('should observe methods relying on this', () => {
+    const obj = reactive({
+      a: 1,
+      b() {
+        return this.a
+      }
+    })
+
+    let dummy
+    effect(() => (dummy = obj.b()))
+    expect(dummy).toBe(1)
+    obj.a++
+    expect(dummy).toBe(2)
+  })
+
   it('should not observe set operations without a value change', () => {
     let hasDummy, getDummy
     const obj = reactive({ prop: 'value' })
@@ -485,6 +517,16 @@ describe('reactivity/effect', () => {
     expect(childSpy).toHaveBeenCalledTimes(5)
   })
 
+  it('should observe json methods', () => {
+    let dummy = <Record<string, number>>{}
+    const obj = reactive<Record<string, number>>({})
+    effect(() => {
+      dummy = JSON.parse(JSON.stringify(obj))
+    })
+    obj.a = 1
+    expect(dummy.a).toBe(1)
+  })
+
   it('should observe class method invocations', () => {
     class Model {
       count: number
@@ -563,19 +605,19 @@ describe('reactivity/effect', () => {
       {
         effect: runner,
         target: toRaw(obj),
-        type: OperationTypes.GET,
+        type: TrackOpTypes.GET,
         key: 'foo'
       },
       {
         effect: runner,
         target: toRaw(obj),
-        type: OperationTypes.HAS,
+        type: TrackOpTypes.HAS,
         key: 'bar'
       },
       {
         effect: runner,
         target: toRaw(obj),
-        type: OperationTypes.ITERATE,
+        type: TrackOpTypes.ITERATE,
         key: ITERATE_KEY
       }
     ])
@@ -601,7 +643,7 @@ describe('reactivity/effect', () => {
     expect(events[0]).toEqual({
       effect: runner,
       target: toRaw(obj),
-      type: OperationTypes.SET,
+      type: TriggerOpTypes.SET,
       key: 'foo',
       oldValue: 1,
       newValue: 2
@@ -613,7 +655,7 @@ describe('reactivity/effect', () => {
     expect(events[1]).toEqual({
       effect: runner,
       target: toRaw(obj),
-      type: OperationTypes.DELETE,
+      type: TriggerOpTypes.DELETE,
       key: 'foo',
       oldValue: 2
     })
@@ -636,18 +678,63 @@ describe('reactivity/effect', () => {
     expect(dummy).toBe(3)
   })
 
+  it('stop with scheduler', () => {
+    let dummy
+    const obj = reactive({ prop: 1 })
+    const queue: (() => void)[] = []
+    const runner = effect(
+      () => {
+        dummy = obj.prop
+      },
+      {
+        scheduler: e => queue.push(e)
+      }
+    )
+    obj.prop = 2
+    expect(dummy).toBe(1)
+    expect(queue.length).toBe(1)
+    stop(runner)
+
+    // a scheduled effect should not execute anymore after stopped
+    queue.forEach(e => e())
+    expect(dummy).toBe(1)
+  })
+
   it('events: onStop', () => {
+    const onStop = jest.fn()
     const runner = effect(() => {}, {
-      onStop: jest.fn()
+      onStop
     })
 
     stop(runner)
-    expect(runner.onStop).toHaveBeenCalled()
+    expect(onStop).toHaveBeenCalled()
   })
 
-  it('markNonReactive', () => {
+  it('stop: a stopped effect is nested in a normal effect', () => {
+    let dummy
+    const obj = reactive({ prop: 1 })
+    const runner = effect(() => {
+      dummy = obj.prop
+    })
+    stop(runner)
+    obj.prop = 2
+    expect(dummy).toBe(1)
+
+    // observed value in inner stopped effect
+    // will track outer effect as an dependency
+    effect(() => {
+      runner()
+    })
+    expect(dummy).toBe(2)
+
+    // notify outer effect to run
+    obj.prop = 3
+    expect(dummy).toBe(3)
+  })
+
+  it('markRaw', () => {
     const obj = reactive({
-      foo: markNonReactive({
+      foo: markRaw({
         prop: 0
       })
     })
@@ -660,5 +747,49 @@ describe('reactivity/effect', () => {
     expect(dummy).toBe(0)
     obj.foo = { prop: 1 }
     expect(dummy).toBe(1)
+  })
+
+  it('should not be trigger when the value and the old value both are NaN', () => {
+    const obj = reactive({
+      foo: NaN
+    })
+    const fnSpy = jest.fn(() => obj.foo)
+    effect(fnSpy)
+    obj.foo = NaN
+    expect(fnSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('should trigger all effects when array length is set 0', () => {
+    const observed: any = reactive([1])
+    let dummy, record
+    effect(() => {
+      dummy = observed.length
+    })
+    effect(() => {
+      record = observed[0]
+    })
+    expect(dummy).toBe(1)
+    expect(record).toBe(1)
+
+    observed[1] = 2
+    expect(observed[1]).toBe(2)
+
+    observed.unshift(3)
+    expect(dummy).toBe(3)
+    expect(record).toBe(3)
+
+    observed.length = 0
+    expect(dummy).toBe(0)
+    expect(record).toBeUndefined()
+  })
+
+  it('should handle self dependency mutations', () => {
+    const count = ref(0)
+    effect(() => {
+      count.value++
+    })
+    expect(count.value).toBe(1)
+    count.value = 10
+    expect(count.value).toBe(11)
   })
 })
